@@ -316,6 +316,7 @@ exit:
   return ret;
 }
 
+//  重要的调用函数 关于网络插件 初始化 5
 static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, int ndev, int rank) {
   if (ndev < 1) {
     WARN("invalid device count (%d) requested", ndev);
@@ -331,8 +332,13 @@ static ncclResult_t commAlloc(struct ncclComm* comm, struct ncclComm* parent, in
   comm->destructorHead = nullptr;
   comm->rank = rank;
   comm->nRanks = ndev;
-
+  // 两者的关系是“前者准备候选网络后端，后者初始化并选择后端”
+  // *****6 ncclNetPluginLoad-> 尝试加载 NCCL_NET_PLUGIN 指定的 libnccl-net.so -> 成功时把插件适配器放入 ncclNets[0]
+  // 如果网络插件加载成功，ncclNetInit 会先考虑插件；加载失败则跳过插件，继续尝试内置 IB，再回退到 Socket。
   NCCLCHECK(ncclNetPluginLoad(comm));
+  // *****7    -> 遍历 ncclNets[] -> 对每个候选调用 netGetState()-> netGetState() 调用 candidate->init(...)
+    // -> 若 candidate 是 ncclNetIb -> ncclIbInit(...) 
+    // -> 选择最终 comm->ncclNet
   NCCLCHECK(ncclNetInit(comm));
   NCCLCHECK(ncclProfilerPluginInit(comm));
   INFO(NCCL_INIT, "Using network %s", comm->ncclNet->name);
@@ -929,6 +935,8 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   NCCLCHECKGOTO(ncclCalloc(&nodesFirstRank, nranks), ret, fail);
   NCCLCHECKGOTO(ncclCalloc(&nodesTreePatterns, nranks), ret, fail);
   NCCLCHECKGOTO(ncclCalloc(&comm->rankToNode, comm->nRanks), ret, fail);
+  //init.cc:932 - 计算每个 rank 属于哪个节点  
+  // 把 MPI 收集到的主机信息、GPU 信息，转换成自己的「NCCL rank → 节点」映射，为后续选择最优通信路径（同节点走 P2P/NVLink，跨节点走 RDMA）做准备
   for (int r=0; r<nranks; r++) {
     int node;
     int firstRank = allGather3Data[r].topoRanks.ringRecv[0];
@@ -939,7 +947,7 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
       // Record tree pattern of each node as they can be different depending on sm arch
       nodesTreePatterns[node] = allGather3Data[r].graphInfo[NCCL_ALGO_TREE].pattern;
     }
-    comm->rankToNode[r] = node;
+    comm->rankToNode[r] = node; // ← 记录：NCCL rank r 属于哪个节点
 
     if (comm->cpuArch != allGather3Data[r].cpuArch &&
         comm->cpuArch != NCCL_TOPO_CPU_ARCH_MIXED) {
@@ -1351,6 +1359,7 @@ fail:
   goto exit;
 }
 
+// &&&
 static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   struct ncclCommInitRankAsyncJob* job = (struct ncclCommInitRankAsyncJob*)job_;
   ncclComm_t comm = job->comm;
@@ -1388,6 +1397,7 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
     // Negative color does not create a new comm object. We needed to take part in the allgather, but we're done now.
     if (job->color == NCCL_SPLIT_NOCOLOR) goto exit;
     timers[TIMER_INIT_ALLOC] = clockNano();
+    // ****4
     NCCLCHECKGOTO(commAlloc(comm, job->parent, job->nranks, job->myrank), res, fail);
     timers[TIMER_INIT_ALLOC] = clockNano() - timers[TIMER_INIT_ALLOC];
     // child hash obtained from (parent hash, split count, color)
@@ -1405,6 +1415,7 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
     commIdHash = 0;
   } else {
     timers[TIMER_INIT_ALLOC] = clockNano();
+    // ****
     NCCLCHECKGOTO(commAlloc(comm, NULL, job->nranks, job->myrank), res, fail);
     timers[TIMER_INIT_ALLOC] = clockNano() - timers[TIMER_INIT_ALLOC];
     // obtain a unique hash using the first commId
@@ -1648,6 +1659,7 @@ static void ncclCommInitJobFree(void* _job) {
   free(_job);
 }
 
+// ……………………2
 static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, int nId, ncclUniqueId* commId, int myrank, int cudaDev, ncclConfig_t *config, const char funcName[]) {
   if (nId <= 0 || nId > nranks) {
     WARN("improper usage of ncclCommInitRank: nId = %d, nranks=%d", nId, nranks);
@@ -1713,6 +1725,7 @@ static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, int nId
     NCCLCHECKGOTO(bootstrapCreateRoot((struct ncclBootstrapHandle*)&job->commId[0], true), res, fail);
   }
   launchedJob = true;
+  // **** 3
   NCCLCHECKGOTO(ncclAsyncLaunch((struct ncclAsyncJob*)job, ncclCommInitRankFunc, NULL, ncclCommInitJobFree, comm), res, fail);
 
 exit:
@@ -1728,7 +1741,7 @@ fail:
   if (newcomm) *newcomm = NULL;
   goto exit;
 }
-
+// !!!!!!!!!!!!!!!!!! 重要的调用函数    
 NCCL_API(ncclResult_t, ncclCommInitRank, ncclComm_t* newcomm, int nranks, ncclUniqueId commId, int myrank);
 ncclResult_t ncclCommInitRank(ncclComm_t* newcomm, int nranks, ncclUniqueId commId, int myrank) {
   NVTX3_RANGE(NcclNvtxParamsCommInitRank)
@@ -1738,7 +1751,7 @@ ncclResult_t ncclCommInitRank(ncclComm_t* newcomm, int nranks, ncclUniqueId comm
   int cudaDev;
   ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
   CUDACHECK(cudaGetDevice(&cudaDev));
-
+  //  从这里开始调用网络插件的初始化函数 ncclCommInitRankDev
   NCCLCHECK(ncclCommInitRankDev(newcomm, nranks, 1, &commId, myrank, cudaDev, &config, __func__));
 
   NVTX3_RANGE_ADD_PAYLOAD(CommInitRank, NcclNvtxParamsCommInitRankSchema,
@@ -2176,6 +2189,7 @@ ncclResult_t ncclCommSplit(ncclComm_t comm, int color, int key, ncclComm_t *newc
   job->key = key;
   job->cudaDev = comm->cudaDev;
   snprintf(job->funcName, NCCL_COMMINIT_FUNCNAME_LEN, "%s", __func__);
+  // *****
   NCCLCHECKGOTO(ncclAsyncLaunch((struct ncclAsyncJob*)job, ncclCommInitRankFunc, NULL, free, comm), res, fail);
 
 exit:

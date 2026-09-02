@@ -90,19 +90,24 @@ pthread_mutex_t bootstrapNetLock = PTHREAD_MUTEX_INITIALIZER;
 NCCL_PARAM(BootstrapNetEnable,"OOB_NET_ENABLE", 0);
 
 ncclResult_t bootstrapNetInit() {
+  // 负责为进程间的引导通信（OOB, Out-Of-Band）选择并缓存本地的网络接口信息
   if (bootstrapNetInitDone == 0) {
     pthread_mutex_lock(&bootstrapNetLock);
     if (bootstrapNetInitDone == 0) {
+      // 本质上是一个 IP:端口 字符串，用来让多进程/多机的 bootstrap 引导阶段能够找到彼此
       const char* env = ncclGetEnv("NCCL_COMM_ID");
+      //函数根据环境变量 NCCL_COMM_ID 是否存在，走不同的接口选择策略：
       if (env) {
         union ncclSocketAddress remoteAddr;
+        // 从环境变量 NCCL_COMM_ID 解析出远程地址
         if (ncclSocketGetAddrFromString(&remoteAddr, env) != ncclSuccess) {
           WARN("Invalid NCCL_COMM_ID, please use format: <ipv4>:<port> or [<ipv6>]:<port> or <hostname>:<port>");
           pthread_mutex_unlock(&bootstrapNetLock);
           return ncclInvalidArgument;
         }
+        // 找到与远端地址同子网的本地接口 用户指定了一个远端通信地址（NCCL_COMM_ID），函数会自动选择一个与该远端地址在同一子网的本地网卡。这确保了后续 bootstrap 通信走的是正确的网络路径。
         if (ncclFindInterfaceMatchSubnet(bootstrapNetIfName, &bootstrapNetIfAddr, &remoteAddr, MAX_IF_NAME_SIZE, 1) <= 0) {
-          WARN("NET/Socket : No usable listening interface found");
+          WARN("NET/Socket : No usable listening interface found"); //// 没有可用接口
           pthread_mutex_unlock(&bootstrapNetLock);
           return ncclSystemError;
         }
@@ -114,6 +119,7 @@ ncclResult_t bootstrapNetInit() {
           return ncclInvalidUsage;
         }
       }
+      // 将选中的接口名和 IP 地址格式化为日志，例如：Bootstrap: Using eth0:192.168.1.100，方便调试和运维确认
       char line[SOCKET_NAME_MAXLEN+MAX_IF_NAME_SIZE+2];
       snprintf(line, sizeof(line), " %s:", bootstrapNetIfName);
       ncclSocketToString(&bootstrapNetIfAddr, line+strlen(line));
