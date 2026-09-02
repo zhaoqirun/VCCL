@@ -1,6 +1,9 @@
 /*************************************************************************
  * Copyright (c) 2015-2022, NVIDIA CORPORATION. All rights reserved.
- *
+ git add .
+ git status
+ git commit -m ""
+ git push origin main
  * See LICENSE.txt for license information
  ************************************************************************/
 
@@ -44,6 +47,7 @@ const char* ncclFuncStr[NCCL_NUM_FUNCTIONS] = { "Broadcast", "Reduce", "AllGathe
 const char* ncclAlgoStr[NCCL_NUM_ALGORITHMS] = { "Tree", "Ring", "CollNetDirect", "CollNetChain", "NVLS", "NVLSTree", "PAT" };
 const char* ncclProtoStr[NCCL_NUM_PROTOCOLS] = { "LL", "LL128", "Simple" };
 
+// 宏注册可通过环境变量覆盖的配置参数，展开后生成 ncclParamXxx() 函数。
 NCCL_PARAM(GroupCudaStream, "GROUP_CUDA_STREAM", NCCL_GROUP_CUDA_STREAM);
 
 NCCL_PARAM(CheckPointers, "CHECK_POINTERS", 0);
@@ -58,6 +62,8 @@ NCCL_PARAM(GdrCopyEnable, "GDRCOPY_ENABLE", 0);
 // GDRCOPY support
 gdr_t ncclGdrCopy = NULL;
 
+// ncclResult_t 是 NCCL 的错误码类型 函数理论上负责“初始化 GDRCopy，并返回初始化结果
+// GDRCopy 是 NVIDIA GPU Direct 生态中的一个用户态/内核驱动组合，核心用途是：允许 CPU 高效地直接访问 GPU 显存中的小块数据。GDRCopy主要用于一些小规模控制数据或低延迟 CPU↔GPU 操作。
 ncclResult_t initGdrCopy() {
   if (ncclParamGdrCopyEnable() == 1) {
     ncclGdrCopy = ncclGdrInit();
@@ -91,16 +97,24 @@ ncclResult_t ncclGetVersion(int* version) {
 }
 
 NCCL_API(ncclResult_t, ncclGetUniqueId, ncclUniqueId* out);
+// 生成一个全局唯一的通信 ID（ncclUniqueId），后续所有参与通信的进程通过这个 ID 
+// 进行 rendezvous（集合点同步），建立通信组 ncclComm_t。
 ncclResult_t ncclGetUniqueId(ncclUniqueId* out) {
+  // 初始化 NCCL 运行时（仅执行一次，内部用 pthread_once 保证）
   NCCLCHECK(ncclInit());
+  // 	校验输出指针不为 NULL
   NCCLCHECK(PtrCheck(out, "GetUniqueId", "out"));
   struct ncclBootstrapHandle handle;
+  // 	通过 bootstrap 网络生成一个全局唯一 ID（包含 socket 地址等信息）
   NCCLCHECK(bootstrapGetUniqueId(&handle));
   // ncclUniqueId and bootstrapHandle don't have the same size and alignment
   // reset to 0 to avoid undefined data
+  // 	清零目标缓冲区，避免因结构体大小/对齐不同导致残留未定义数据
   memset(out, 0, sizeof(*out));
-  // copy to avoid alignment mismatch
+  // copy to avoid alignment mismatch 
+  // 将 bootstrapHandle 内容拷贝到 ncclUniqueId（两者大小不同，ncclUniqueId 更大）
   memcpy(out, &handle, sizeof(handle));
+  // 	调试追踪，打印该 UniqueId 的哈希值
   TRACE_CALL("ncclGetUniqueId(0x%llx)", (unsigned long long)getHash(out->internal, NCCL_UNIQUE_ID_BYTES));
   return ncclSuccess;
 }

@@ -18,6 +18,7 @@
 #include <pwd.h>
 
 const char* userHomeDir() {
+  //getuid() 获取当前进程的用户 ID  getpwuid() 从系统用户数据库（/etc/passwd）查找该用户的记录  返回 home 目录路径（如 /home/user），找不到则返回 NULL// 比 getenv("HOME") 更可靠，不依赖环境变量是否被正确设置
   struct passwd *pwUser = getpwuid(getuid());
   return pwUser == NULL ? NULL : pwUser->pw_dir;
 }
