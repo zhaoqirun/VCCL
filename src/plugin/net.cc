@@ -176,6 +176,7 @@ static ncclResult_t netGetState(int i, enum ncclNetState* state) {
   pthread_mutex_lock(&netLock);
   if (ncclNetStates[i] == ncclNetStateInit) {
     int ndev;
+    // ----8   当 i == 1 时，它等价于：ncclIbInit(ncclDebugLog, ncclProfilerCallback);
     if (ncclNets[i]->init(ncclDebugLog, ncclProfilerCallback) != ncclSuccess) ncclNetStates[i] = ncclNetStateDisabled;
     else if (ncclNets[i]->devices(&ndev) != ncclSuccess || ndev <= 0) ncclNetStates[i] = ncclNetStateDisabled;
     else ncclNetStates[i] = ncclNetStateEnabled;
@@ -207,6 +208,7 @@ ncclResult_t ncclNetInit(struct ncclComm* comm) {
   for (int i=0; i<3; i++) {
     if (ncclNets[i] == nullptr) continue;
     enum ncclNetState state;
+    // ----7
     NCCLCHECK(netGetState(i, &state));
     if (state != ncclNetStateEnabled) continue;
     if (netName && strcasecmp(netName, ncclNets[i]->name) != 0) continue;

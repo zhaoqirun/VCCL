@@ -1,6 +1,8 @@
 #include "nccl.h"
 #include "nvtx.h"
 
+// 向 NVTX 注册 NCCL 规约操作（Reduction Operation）的枚举映射表，以便在使用 Nsight Systems / Nsight Compute 
+// 等性能分析工具时，能将底层整数值还原为人类可读的操作名称。
 static constexpr const nvtxPayloadEnum_t NvtxEnumRedSchema[] = {
   {"Sum", ncclSum, 0},
   {"Product", ncclProd, 0},
@@ -13,10 +15,11 @@ static constexpr const nvtxPayloadEnum_t NvtxEnumRedSchema[] = {
 void initNvtxRegisteredEnums() {
   // Register schemas and strings
   constexpr const nvtxPayloadEnumAttr_t eAttr {
+    // 位掩码，告诉 NVTX 下面哪些字段是有效的。这里声明了 entries、numEntries、size、schemaId 四项
     .fieldMask = NVTX_PAYLOAD_ENUM_ATTR_ENTRIES | NVTX_PAYLOAD_ENUM_ATTR_NUM_ENTRIES |
       NVTX_PAYLOAD_ENUM_ATTR_SIZE | NVTX_PAYLOAD_ENUM_ATTR_SCHEMA_ID,
     .name = NULL,
-    .entries = NvtxEnumRedSchema,
+    .entries = NvtxEnumRedSchema, //// 枚举翻译表数组（{"Sum", ncclSum, 0} 这种条目）
     .numEntries = std::extent<decltype(NvtxEnumRedSchema)>::value,
     .sizeOfEnum = sizeof(ncclRedOp_t),
     .schemaId = NVTX_PAYLOAD_ENTRY_NCCL_REDOP,
@@ -24,4 +27,6 @@ void initNvtxRegisteredEnums() {
   };
 
   nvtxPayloadEnumRegister(nvtx3::domain::get<nccl_domain>(), &eAttr);
+  // 用 NVTX 3 的编译期静态域机制，把 NCCL 的规约操作枚举表，注册到 NCCL 专属的 NVTX 域里，
+  // 让后续 NCCL 的 payload 标注能被性能工具自动翻译成人类可读的操作名。
 }

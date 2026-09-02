@@ -151,6 +151,13 @@ static int findInterfaces(const char* prefixList, char* names, union ncclSocketA
 #ifdef ENABLE_TRACE
   char line[SOCKET_NAME_MAXLEN+1];
 #endif
+// prefixList	接口名前缀匹配串，支持特殊语法（见下文）
+// names	输出 → 找到的接口名称（扁平数组，每个名字占 maxIfNameSize 字节）
+// addrs	输出 → 找到的接口 IP 地址
+// sock_family	地址族过滤器：-1=不限, AF_INET=仅IPv4, AF_INET6=仅IPv6
+// maxIfNameSize	每个接口名最大字节数
+// maxIfs	最多返回接口数
+// 返回值	实际找到的接口数量
   struct netIf userIfs[MAX_IFS];
   bool searchNot = prefixList && prefixList[0] == '^';
   if (searchNot) prefixList++;
@@ -292,14 +299,17 @@ int ncclFindInterfaceMatchSubnet(char* ifNames, union ncclSocketAddress* localAd
 }
 
 ncclResult_t ncclSocketGetAddrFromString(union ncclSocketAddress* ua, const char* ip_port_pair) {
+  // ，功能是 将 IP[:port] 格式的字符串解析为 ncclSocketAddress 套接字地址结构体。支持 IPv4、IPv6（含 link-local 带 % 接口名）以及 hostname
   if (!(ip_port_pair && strlen(ip_port_pair) > 1)) {
     WARN("Net : string is null");
     return ncclInvalidArgument;
   }
 
   bool ipv6 = ip_port_pair[0] == '[';
+  // // 判定是否为 IPv6 格式：以 '[' 开头（如 [::1]:8080 或 [fe80::1%eth0]:8080）
   /* Construct the sockaddress structure */
   if (!ipv6) {
+    //======================== 路径 A：IPv4 或 hostname ========================
     struct netIf ni;
     // parse <ip_or_hostname>:<port> string, expect one pair
     if (parseStringList(ip_port_pair, &ni, 1) != 1) {
@@ -310,22 +320,22 @@ ncclResult_t ncclSocketGetAddrFromString(union ncclSocketAddress* ua, const char
     struct addrinfo hints, *p;
     int rv;
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_family = AF_UNSPEC;  // Allow IPv4 or IPv6
+    hints.ai_socktype = SOCK_STREAM; //
 
     if ( (rv = getaddrinfo(ni.prefix, NULL, &hints, &p)) != 0) {
       WARN("Net : error encountered when getting address info : %s", gai_strerror(rv));
       return ncclInvalidArgument;
     }
 
-    // use the first
-    if (p->ai_family == AF_INET) {
+    // use the first // 只取 getaddrinfo 返回链表的第一个结果
+    if (p->ai_family == AF_INET) { //// ---------- A1: 解析结果为 IPv4 ----------
       struct sockaddr_in& sin = ua->sin;
       memcpy(&sin, p->ai_addr, sizeof(struct sockaddr_in));
       sin.sin_family = AF_INET;                        // IPv4
       //inet_pton(AF_INET, ni.prefix, &(sin.sin_addr));  // IP address
       sin.sin_port = htons(ni.port);                   // port
-    } else if (p->ai_family == AF_INET6) {
+    } else if (p->ai_family == AF_INET6) { //解析结果为 IPv6（罕见，但 hostname 可能解析到 IPv6）
       struct sockaddr_in6& sin6 = ua->sin6;
       memcpy(&sin6, p->ai_addr, sizeof(struct sockaddr_in6));
       sin6.sin6_family = AF_INET6;                     // IPv6
@@ -338,9 +348,11 @@ ncclResult_t ncclSocketGetAddrFromString(union ncclSocketAddress* ua, const char
       return ncclInvalidArgument;
     }
 
-    freeaddrinfo(p); // all done with this structure
+    freeaddrinfo(p); // all done with this structure // 释放 getaddrinfo 分配的链表
 
   } else {
+    // 显式 IPv6 格式 [ip]:port ========================
+    // // 在方括号内同时查找 '%'（link-local 分隔符）和 ']'（结束符）
     int i, j = -1, len = strlen(ip_port_pair);
     for (i = 1; i < len; i++) {
       if (ip_port_pair[i] == '%') j = i;
@@ -350,6 +362,7 @@ ncclResult_t ncclSocketGetAddrFromString(union ncclSocketAddress* ua, const char
       WARN("Net : No valid [IPv6]:port pair found");
       return ncclInvalidArgument;
     }
+    // 是否为全局 IPv6 地址：没有 '%' → 全局；有 '%' → link-local（带接口名
     bool global_scope = (j == -1 ? true : false);     // If no % found, global scope; otherwise, link scope
 
     char ip_str[NI_MAXHOST], port_str[NI_MAXSERV], if_name[IFNAMSIZ];
@@ -372,20 +385,31 @@ ncclResult_t ncclSocketGetAddrFromString(union ncclSocketAddress* ua, const char
 }
 
 int ncclFindInterfaces(char* ifNames, union ncclSocketAddress *ifAddrs, int ifNameMaxSize, int maxIfs) {
+  // NCCL/VCCL 自动挑选本地网络接口的核心策略函数。它按一套优先级递减的回退链寻找可用网卡，并返回它们的名称和 IP 地址，供后续的 socket 通信使用。
+  // ifNames	输出缓冲区，存放找到的接口名称
+  // ifAddrs	输出缓冲区，存放找到的接口地址（IPv4/IPv6 联合体）
+  // ifNameMaxSize	每个接口名称的最大长度
+  // maxIfs	最多返回多少个接口
+  // 返回值	实际找到的接口数量 nIfs
   static int shownIfName = 0;
   int nIfs = 0;
   // Allow user to force the INET socket family selection
   int sock_family = envSocketFamily();
   // User specified interface
   const char* env = ncclGetEnv("NCCL_SOCKET_IFNAME");
-  if (env && strlen(env) > 1) {
+  if (env && strlen(env) > 1) { //：用户显式指定了接口名（环境变量 NCCL_SOCKET_IFNAME）
     INFO(NCCL_ENV, "NCCL_SOCKET_IFNAME set by environment to %s", env);
     // Specified by user : find or fail
     if (shownIfName++ == 0) INFO(NCCL_NET, "NCCL_SOCKET_IFNAME set to %s", env);
     nIfs = findInterfaces(env, ifNames, ifAddrs, sock_family, ifNameMaxSize, maxIfs);
   } else {
-    // Try to automatically pick the right one
+    // Try to automatically pick the right one 当用户未指定接口时，函数按以下优先级依次尝试，一旦某级找到了接口就立即停止：
     // Start with IB
+    // 优先级 1: IB 网卡       → findInterfaces("ib")
+    // 优先级 2: 同子网匹配     → ncclFindInterfaceMatchSubnet()   (依赖 NCCL_COMM_ID)
+    // 优先级 3: 非 docker/lo  → findInterfaces("^docker,lo")
+    // 优先级 4: docker 网卡    → findInterfaces("docker")
+    // 优先级 5: loopback      → findInterfaces("lo")
     nIfs = findInterfaces("ib", ifNames, ifAddrs, sock_family, ifNameMaxSize, maxIfs);
     // else see if we can get some hint from COMM ID
     if (nIfs == 0) {

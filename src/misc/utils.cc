@@ -132,6 +132,7 @@ uint64_t getPidHash(void) {
   return getHash(pname, strlen(pname));
 }
 
+// 网卡配置字符串解析函数，它把形如 "eth0:8472,eth1,eth2:9090" 这样的字符串，拆解为结构化的 netIf 数组
 int parseStringList(const char* string, struct netIf* ifList, int maxList) {
   if (!string) return 0;
 
@@ -140,6 +141,14 @@ int parseStringList(const char* string, struct netIf* ifList, int maxList) {
   int ifNum = 0;
   int ifC = 0;
   char c;
+  // "eth0:8472,eth1,eth2:9090"
+  // │  │   │  │   │  │
+  // │  │   │  │   │  └─ 端口号
+  // │  │   │  │   └─ 网卡名
+  // │  │   │  └─ 逗号分隔
+  // │  │   └─ 网卡名（无端口，port 置为 -1）
+  // │  └─ 冒号分隔 port
+  // └─ 网卡名（prefix）
   do {
     c = *ptr;
     if (c == ':') {

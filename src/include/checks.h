@@ -128,6 +128,11 @@
   } \
 } while (0)
 
+// 执行 call → 结果存入 RES
+//         ↓
+// RES 是 ncclSuccess 或 ncclInProgress？
+//         ↓ 是                ↓ 否（出错）
+//    继续向下执行         打印日志 → goto label
 #define NCCLCHECKGOTO(call, RES, label) do { \
   RES = call; \
   if (RES != ncclSuccess && RES != ncclInProgress) { \
