@@ -105,7 +105,7 @@ ncclResult_t bootstrapNetInit() {
           pthread_mutex_unlock(&bootstrapNetLock);
           return ncclInvalidArgument;
         }
-        // 找到与远端地址同子网的本地接口 用户指定了一个远端通信地址（NCCL_COMM_ID），函数会自动选择一个与该远端地址在同一子网的本地网卡。这确保了后续 bootstrap 通信走的是正确的网络路径。
+        // *******找到与远端地址同子网的本地接口 用户指定了一个远端通信地址（NCCL_COMM_ID），函数会自动选择一个与该远端地址在同一子网的本地网卡。这确保了后续 bootstrap 通信走的是正确的网络路径。
         if (ncclFindInterfaceMatchSubnet(bootstrapNetIfName, &bootstrapNetIfAddr, &remoteAddr, MAX_IF_NAME_SIZE, 1) <= 0) {
           WARN("NET/Socket : No usable listening interface found"); //// 没有可用接口
           pthread_mutex_unlock(&bootstrapNetLock);
@@ -270,6 +270,22 @@ fail:
   (void)ncclSocketClose(&sock);
   return res;
 }
+// bootstrapRoot 位于 bootstrap.cc，它的核心逻辑是一个两阶段协调协议：
+// 阶段一：收集 (Collect)
+// ┌──────────────────────────────────────────────────────┐
+// │ 循环 accept 所有 Rank 的连接                          │
+// │ 每个 Rank 发来: {rank, 自己的监听地址, 网络 handle}    │
+// │ 收集到 rankInfo[] 和 rankAddressesRoot[] 数组中       │
+// └──────────────────────────────────────────────────────┘
+//                           │
+//                           ▼
+// 阶段二：分发 (Distribute)  —— 构建 Ring 拓扑
+// ┌──────────────────────────────────────────────────────┐
+// │ 对每个 Rank，告诉它：                                 │
+// │   "你的下一个 Rank 的连接信息是 XXX"                   │
+// │                                                     │
+// │  例如 Rank 0 收到 Rank 1 的地址，Rank 1 收到 Rank 2 的 │
+// │  以此类推，最后一个 Rank 收到 Rank 0 的（环形拓扑）     │
 static void* bootstrapRoot(void* rargs) {
   uint64_t timers[BOOTSTRAP_INIT_ROOT_N] = {0};
   struct bootstrapRootArgs* args = (struct bootstrapRootArgs*)rargs;
@@ -279,6 +295,14 @@ static void* bootstrapRoot(void* rargs) {
   int nranks = 0, c = 0;
   int iroot = 0, nroots = 0, localId = 0;
   int nrecv = 0, n2send = 0;
+//   struct extInfo {                              // 每个 Rank 发给 Root 的信息
+//   int rank;                                   // 我的 Rank 编号
+//   int nranks;                                 // 总 Rank 数
+//   int iroot;                                  // 当前 Root 索引
+//   int nroots;                                 // 总 Root 数
+//   union ncclSocketAddress listenRootAddress;  // 我的监听地址（供 Root 回连我）
+//   union ringConnectInfo connectInfo;          // 我的 Ring 连接信息（网络 handle 等）
+// };
   struct extInfo info;
   union ringConnectInfo* rankInfo = NULL;
   union ncclSocketAddress* rankAddressesRoot = NULL; // for initial rank <-> root information exchange
@@ -294,9 +318,13 @@ static void* bootstrapRoot(void* rargs) {
   TRACE(NCCL_BOOTSTRAP, "BEGIN");
   BOOTSTRAP_PROF_OPEN(timers[BOOTSTRAP_INIT_ROOT_WAIT]);
   /* Receive addresses from all ranks */
+  // 收集（边收边发）  第一个 Rank 连接上来时，从 info 中解析出 nranks、nroots、iroot 等全局参数，据此分配 rankInfo[] 和 rankAddressesRoot[] 数组。
+  // Root 循环 accept 每个 Rank 的连接，收到 extInfo                 │                                                             │
+  // │  Rank 0 ──→ extInfo ──→ Root 存入 rankInfo[0], rankAddressesRoot[0] │  
   do {
     struct ncclSocket sock;
     NCCLCHECKGOTO(ncclSocketInit(&sock), res, out);
+    // 阻塞等待一个 Rank 连接
     NCCLCHECKGOTO(ncclSocketAccept(&sock, listenSock), res, out);
     NCCLCHECKGOTO(socketRecv(&sock, &info, sizeof(info)), res, out);
     NCCLCHECKGOTO(ncclSocketClose(&sock), res, out);
@@ -328,8 +356,10 @@ static void* bootstrapRoot(void* rargs) {
     // if the previous has already checked in, send the newly received handle, if not save the handle for later
     // if we have more than 1 root, I do not own the previous of local_id = 0
     // if we have prev > n2send, we do not send anything
+    // 前驱转发：如果 Rank[prev] 已经到了，把当前 Rank 的信息发给它
     int prev = (nroots > 1) ? (localId - 1) : BOOTSTRAP_PID(localId - 1, nrecv);
     if (prev >= 0 && prev < n2send && memcmp(&zeroAddress, &rankAddressesRoot[prev], sizeof(union ncclSocketAddress)) != 0) {
+      // 含义：告诉 Rank[prev]："你的下一个是 Rank[curr]，这是它的连接信息"
       NCCLCHECKGOTO(rootSend(&rankAddressesRoot[prev], magic, &info.connectInfo), res, out);
     } else {
       memcpy(&rankInfo[localId], &info.connectInfo, sizeof(union ringConnectInfo));
@@ -337,6 +367,7 @@ static void* bootstrapRoot(void* rargs) {
     // if the next rank has checked in, send the newly received info, if not save the addr for later
     // for nroots >=1, I will always own the information of the next connection
     // if the local_id id must be [0 ; n2send[ otherwise we do not answer
+    // 后继转发：如果 Rank[next] 已经到了，把它的信息发给当前 Rank
     int next = BOOTSTRAP_PID(localId + 1, nrecv);
     if (localId >= 0 && localId < n2send && memcmp(&zeroInfo, &rankInfo[next], sizeof(union ringConnectInfo)) != 0) {
       NCCLCHECKGOTO(rootSend(&info.listenRootAddress, magic, &rankInfo[next]), res, out);
@@ -352,6 +383,7 @@ static void* bootstrapRoot(void* rargs) {
   // send the remaining info to the ranks who haven't received anything
   BOOTSTRAP_PROF_OPEN(timers[BOOTSTRAP_INIT_ROOT_SEND]);
   // here we need to send info only to my own local process
+  // 补发剩余 处理极端情况：比如 Rank 0 最后到达，阶段一中 prev=-1 不触发，需要阶段二补发。
   for (int r = 0; r < n2send; ++r) {
     // use nrecv to periodize: if 1 root, we will send the first one to the last one, if >1 roots we will send the additional one we have received
     int next = BOOTSTRAP_PID(r + 1, nrecv);
@@ -360,6 +392,11 @@ static void* bootstrapRoot(void* rargs) {
       NCCLCHECKGOTO(rootSend(&rankAddressesRoot[r], magic, &rankInfo[next]), res, out);
     }
   }
+  //         Rank 0 ──→ Rank 1 ──→ Rank 2 ──→ Rank 3
+  //           ↑                                  │
+  //           └──────────────────────────────────┘
+          
+  // 每个 Rank 收到的信息: "你的下一个是 Rank[(i+1)%n]，这是它的连接信息"
   BOOTSTRAP_PROF_CLOSE(timers[BOOTSTRAP_INIT_ROOT_SEND]);
   TRACE(NCCL_BOOTSTRAP | NCCL_PROFILE, "Root timings (wait %f, recv %f, send %f)", timers[BOOTSTRAP_INIT_ROOT_WAIT] / 1e9, timers[BOOTSTRAP_INIT_ROOT_RECV] / 1e9, timers[BOOTSTRAP_INIT_ROOT_SEND] / 1e9);
 out:
@@ -378,19 +415,25 @@ out:
 }
 
 ncclResult_t bootstrapCreateRoot(struct ncclBootstrapHandle* handle, bool idFromEnv) {
+  // NCCL bootstrap 协议中创建集合点（Rendezvous）服务器的核心函数。它的职责简单明了：启动一个监听 Socket，
+  // 并派生一个后台线程来协调所有 Rank 的初次握手
+  // 它在本机开一个监听端口（大门），启动一个后台线程（前台服务员），然后返回实际地址（旅馆地址 + 房间号）。之后所有 Rank 拿着这个地址来入住，服务员（bootstrapRoot 线程）协调大家完成 Ring 拓扑的握手，握手完成后服务员下班（线程退出）。
   ncclResult_t ret = ncclSuccess;
   struct ncclSocket* listenSock = NULL;
   struct bootstrapRootArgs* args = NULL;
   pthread_t thread;
 
   NCCLCHECK(ncclCalloc(&listenSock, 1));
+  // 用 handle 中的地址和 magic 初始化 Socket    魔数，用于验证连接合法性，防止误连
   NCCLCHECKGOTO(ncclSocketInit(listenSock, &handle->addr, handle->magic, ncclSocketTypeBootstrap, NULL, 0), ret, fail);
   NCCLCHECKGOTO(ncclSocketListen(listenSock), ret, fail);
+  // 回填实际绑定的地址到 handle    ：ncclSocketListen 之后立即调用 ncclSocketGetAddr 回填 handle->addr。这是因为当端口号指定为 0 时，操作系统会分配一个随机可用端口——此时必须把实际端口号写回 handle，后续其他 Rank 才能用正确的地址连接过来。
   NCCLCHECKGOTO(ncclSocketGetAddr(listenSock, &handle->addr), ret, fail);
 
   NCCLCHECKGOTO(ncclCalloc(&args, 1), ret, fail);
   args->listenSock = listenSock;
   args->magic = handle->magic;
+  // 这里把 listenSock 和 magic 打包传给 bootstrapRoot 线程，然后 detach 掉——这意味着调用者不需要等待线程结束，线程会在所有 Rank 握手完成后自行退出。
   PTHREADCHECKGOTO(pthread_create(&thread, NULL, bootstrapRoot, (void*)args), "pthread_create", ret, fail);
   ncclSetThreadName(thread, "NCCL BootstrapR");
   PTHREADCHECKGOTO(pthread_detach(thread), "pthread_detach", ret, fail); // will not be pthread_join()'d
@@ -407,6 +450,7 @@ ncclResult_t bootstrapGetUniqueId(struct ncclBootstrapHandle* handle) {
 
   const char* env = ncclGetEnv("NCCL_COMM_ID");
   if (env) {
+    // 情况A：环境变量已设置 → 只填 handle，不创建 Root
     INFO(NCCL_ENV, "NCCL_COMM_ID set by environment to %s", env);
     if (ncclSocketGetAddrFromString(&handle->addr, env) != ncclSuccess) {
       WARN("Invalid NCCL_COMM_ID, please use format: <ipv4>:<port> or [<ipv6>]:<port> or <hostname>:<port>");
@@ -414,6 +458,7 @@ ncclResult_t bootstrapGetUniqueId(struct ncclBootstrapHandle* handle) {
     }
     handle->magic = NCCL_MAGIC;
   } else {
+    // 情况B：环境变量未设置 → 生成随机 magic，使用本地网络接口地址，并创建 Root
     NCCLCHECK(getRandomData(&handle->magic, sizeof(handle->magic)));
     memcpy(&handle->addr, &bootstrapNetIfAddr, sizeof(union ncclSocketAddress));
     NCCLCHECK(bootstrapCreateRoot(handle, false));
@@ -622,6 +667,43 @@ NCCL_PARAM(StaggerThreshold, "UID_STAGGER_THRESHOLD", 256);
 
 NCCL_PARAM(RasEnable, "RAS_ENABLE", 1);
 
+// bootstrapInit() 函数的流程图，描述了各个阶段的主要操作和顺序。
+// ┌─ bootstrapInit() ─────────────────────────────────────────────────┐
+// │                                                                  │
+// │  阶段1: CREATE  ─ 创建监听资源                                    │
+// │    ├─ 创建 Ring 监听 Socket（或 Net 监听）                        │
+// │    └─ 创建 Root 回连监听 Socket                                   │
+// │                                                                  │
+// │  阶段2: DELAY   ─ 错峰连接（避免 Root 过载）                      │
+// │    └─ 大规模场景下，每个 Rank 按 localId 递增延迟连接             │
+// │                                                                  │
+// │  阶段3: SEND    ─ 向 Root 发送自己的连接信息                      │
+// │    ├─ 发送 extInfo 给自己的 Root                                  │
+// │    └─ 如果自己是 Root 的第一个 Rank，额外发给前一个 Root           │
+// │                                                                  │
+// │  阶段4: RECV    ─ 从 Root 接收下一个 Rank 的连接信息               │
+// │    └─ 阻塞等待 Root 回连，收到 nextPeer 信息                      │
+// │                                                                  │
+// │  阶段5: RING_CONNECT ─ 建立 Ring 连接                             │
+// │    ├─ 主动连接 nextPeer（发送端）                                  │
+// │    └─ 接受上一 Rank 的连接（接收端）                               │
+// │                                                                  │
+// │  阶段6: AllGather ─ 通过 Ring 交换所有 Rank 的信息                 │
+// │    ├─ 交换 Proxy 地址（TCP）                                      │
+// │    ├─ 交换 Proxy 地址（UDS）                                      │
+// │    ├─ 交换 P2P 地址                                               │
+// │    └─ 交换 RAS 信息                                               │
+// │                                                                  │
+// │  阶段7: FINALIZE ─ 收尾工作                                       │
+// │    ├─ ncclProxyInit() 初始化 Proxy 服务                           │
+// │    └─ ncclRasAddRanks() 注册 RAS                                 │
+// └──────────────────────────────────────────────────────────────────┘
+// bootstrapInit() 负责在一个 ncclComm 内完成 Bootstrap 通信层初始化。它不处理真正的 GPU collective 数据，而是先让所有 rank：
+// 1. 通过 Root 协调得到环中相邻 rank 的连接信息。
+// 2. 建立用于 bootstrap AllGather 的环形连接。
+// 3. 通过该环交换后续控制面所需的地址和元数据。
+// 4. 初始化 Proxy 与可选的 RAS。
+// 最终结果是 comm->bootstrap 指向已完成初始化的 bootstrapState，其中保存了 ring 通信端点、P2P 地址表、Proxy 地址表等。
 ncclResult_t bootstrapInit(int nHandles, void* handles, struct ncclComm* comm) {
   ncclResult_t result = ncclSuccess;
   int rank = comm->rank;
@@ -629,21 +711,28 @@ ncclResult_t bootstrapInit(int nHandles, void* handles, struct ncclComm* comm) {
   // char nextPeerHandle[NCCL_NET_HANDLE_MAXSIZE];
   struct bootstrapState* state;
   struct ncclSocket* proxySocket;
+  // sock：临时 socket（用于从 Root 接收 next rank 信息） listenSockRoot：给 Root 回连我的监听 socket
   struct ncclSocket sock, listenSockRoot;
+  // info：本 rank 上报给 Root 的 extInfo
   struct extInfo info = {0};
+  // nextPeer：从 Root 收到的、环后继 rank 的连接信息
   union ringConnectInfo nextPeer;
   bool performRasAddRanks = true;
   struct rasRankInit* rasRanks = nullptr;
 
   uint64_t timers[BOOTSTRAP_INIT_TIME_N] = {0};
 
+  // 把上下文写入 state，并挂到 comm->bootstrap，使后续 bootstrapSend/Recv/AllGather 能访问。
+  // magic 取第一个 handle 的值，作为 socket 握手校验，避免误连
   NCCLCHECK(ncclCalloc(&state, 1));
+  // 建立状态对象 state：  本 communicator 的 bootstrap 私有状态，贯穿整个生命周期
   state->rank = rank;
   state->nranks = nranks;
   state->cudaDev = comm->cudaDev;
   state->abortFlag = comm->abortFlag;
   state->net = comm->ncclNet;
   comm->bootstrap = state;
+  // magic 是 socket 握手的校验值，用来避免不同 communicator 或误连进程之间串线。
   comm->magic = state->magic = BOOTSTRAP_HANDLE(handles, 0)->magic; // state and comm magic set to the first magic ID
 
   TRACE(NCCL_BOOTSTRAP, "rank %d nranks %d", rank, nranks);
@@ -655,6 +744,8 @@ ncclResult_t bootstrapInit(int nHandles, void* handles, struct ncclComm* comm) {
   // get the ring connection info
   memset(&nextPeer, 0, sizeof(union ringConnectInfo));
   BOOTSTRAP_PROF_OPEN(timers[BOOTSTRAP_INIT_TIME_CREATE]);
+
+  // 端点一：ring 监听端点（别的 rank 用它连我）。根据 OOB_NET_ENABLE 走网络插件或普通 socket，并把对外连接信息写入 info.connectInfo（union，两种模式分别用 handle 或 addr）。
   if (ncclParamBootstrapNetEnable()) {
     // Create net interface for other ranks to contact me (all gather)
     NCCLCHECK(netGetDevice(rank, comm, &STATE_LISTEN(state, net.dev)));
@@ -664,17 +755,21 @@ ncclResult_t bootstrapInit(int nHandles, void* handles, struct ncclComm* comm) {
     // create socket for ring neightbor to contact mee
     NCCLCHECK(createListenSocket(comm, comm->magic, &STATE_LISTEN(state, socket), &info.connectInfo.addr, ncclSocketTypeBootstrap));
   }
-  // Create socket for root to contact me using the root's magic
+  // 端点二：Root 回连端点。curr_root 是本 rank 所属 Root。用该 Root 的 magic 创建 listenSockRoot，地址写入 info.listenRootAddress，供 Root 稍后把 next rank 信息发回来
   int curr_root = rootIdFromRank(rank, nranks, nHandles);
   NCCLCHECK(createListenSocket(comm, BOOTSTRAP_HANDLE(handles, curr_root)->magic, &listenSockRoot, &info.listenRootAddress, ncclSocketTypeBootstrap));
   BOOTSTRAP_PROF_CLOSE(timers[BOOTSTRAP_INIT_TIME_CREATE]);
 
-  // stagger connection times to avoid an overload of the root
+  // stagger connection times to avoid an overload of the root 
+  // 当一个 Root 管理的 rank 超过 256 时，按 rank 在该 Root 内的局部编号 localId 递增延迟，
+  // 避免大量 rank 同时冲击 Root 的 accept 队列。localId 越大，睡得越久。
   BOOTSTRAP_PROF_OPEN(timers[BOOTSTRAP_INIT_TIME_DELAY]);
   int nRankRoot = nRankFromRoot(curr_root, nranks, nHandles);
-  if (nRankRoot > ncclParamStaggerThreshold()) {
+  // 错峰连接（Stagger）
+  if (nRankRoot > ncclParamStaggerThreshold()) { // 默认阈值 256
     // for socket the message rate in microsec
     double msg_rate = ncclParamStaggerRate() / 1.0e6;
+    // // Rank 0 等 0ms，Rank 1 等 10ms，Rank 2 等 20ms...
     long musec = localIdFromRoot(rank, curr_root, nranks, nHandles) / msg_rate;
     struct timespec tv;
     long c_1e6 = 1e6;
@@ -685,12 +780,14 @@ ncclResult_t bootstrapInit(int nHandles, void* handles, struct ncclComm* comm) {
   }
   BOOTSTRAP_PROF_CLOSE(timers[BOOTSTRAP_INIT_TIME_DELAY]);
 
-  // send info on my listening socket to root
+  // send info on my listening socket to root  SEND 阶段：向 Root 上报
   BOOTSTRAP_PROF_OPEN(timers[BOOTSTRAP_INIT_TIME_SEND]);
   // send contact info to my own root
   info.rank = rank;
   info.iroot = curr_root;
+  // 连接自己的 Root，发送 extInfo（含 rank、监听地址、ring 连接信息）。Root 收集后会把“下一个 rank 的连接信息”回传给你。
   NCCLCHECK(sendToRoot(BOOTSTRAP_HANDLE(handles, curr_root), comm, &info));
+  // 跨 Root 闭环：多 Root 时，每组第一个 rank 额外向前一个 Root 上报，让前一个 Root 能告诉它的最后一个 rank“你的后继在下一组”。这样整个环才能跨越 Root 边界连起来。
   // if needed, send the connection info to the previous root
   if (nHandles > 1 && isFirstFromRoot(rank, curr_root, nranks, nHandles)) {
     int prev_rank = BOOTSTRAP_PID(rank - 1, nranks);
@@ -701,7 +798,9 @@ ncclResult_t bootstrapInit(int nHandles, void* handles, struct ncclComm* comm) {
   }
   BOOTSTRAP_PROF_CLOSE(timers[BOOTSTRAP_INIT_TIME_SEND]);
 
+  // RECV 阶段：接收 next rank 信息
   // get info on my "next" rank in the bootstrap ring from root
+  // 被动等待 Root 回连，收到 nextPeer（环后继的连接信息）。listenSockRoot 一次性使命完成，随即关闭。
   BOOTSTRAP_PROF_OPEN(timers[BOOTSTRAP_INIT_TIME_RECV]);
   NCCLCHECK(ncclSocketInit(&sock));
   NCCLCHECK(ncclSocketAccept(&sock, &listenSockRoot));
@@ -710,6 +809,8 @@ ncclResult_t bootstrapInit(int nHandles, void* handles, struct ncclComm* comm) {
   NCCLCHECK(ncclSocketClose(&listenSockRoot));
   BOOTSTRAP_PROF_CLOSE(timers[BOOTSTRAP_INIT_TIME_RECV]);
 
+  // RING_CONNECT 阶段：建立环连接 
+  // socket 版本内部逻辑：主动 connect 到 nextPeer（send 端），同时 accept 前驱 rank 的连接（recv 端）。每个 rank 同时握着 send/recv 两个方向，形成：
   // accept and connect the ring network
   if (ncclParamBootstrapNetEnable()) {
     NCCLCHECK(netRingConnect(state->net, &state->listen, nextPeer.handle,
@@ -719,6 +820,13 @@ ncclResult_t bootstrapInit(int nHandles, void* handles, struct ncclComm* comm) {
     NCCLCHECK(socketRingConnect(&nextPeer.addr, &STATE_RING(state, socket.send), &STATE_LISTEN(state, socket), &STATE_RING(state, socket.recv), comm->magic, state->abortFlag));
   }
 
+  // 准备 AllGather 用的地址表
+  // 为三张表各自填入本 rank 的槽位（+ rank）：
+  // 表	                     内容
+  // peerProxyAddresses	     Proxy 的 TCP 监听地址
+  // peerProxyAddressesUDS	 Proxy 的 Unix Domain Socket 唯一标识
+  // peerP2pAddresses	       P2P 通信监听地址
+  // 其余槽位留空，等 AllGather 补齐。
   // AllGather all listen handlers
   // in case of failure, those resources will be free'd when calling bootstrapDestroy, so we can return immediatly
   NCCLCHECK(ncclCalloc(&state->peerProxyAddresses, nranks));
@@ -734,12 +842,14 @@ ncclResult_t bootstrapInit(int nHandles, void* handles, struct ncclComm* comm) {
   NCCLCHECKGOTO(ncclCalloc(&state->peerP2pAddresses, nranks), result, fail);
   memcpy(state->peerP2pAddresses + rank, &peerSocketAddress, sizeof(union ncclSocketAddress));
 
+  // 填入本 rank 的 RAS 信息。关键容错：即便 ncclRasCommInit 失败，也不能直接退出，因为环上其它 rank 在等你参与 AllGather；因此只把自己置零并跳过后续注册，保证主协议不被拖死。
   // Initialize RAS
   if (ncclParamRasEnable() == 1) {
     // The RAS thread will take care of freeing the memory allocated below.
     NCCLCHECK(ncclCalloc(&rasRanks, nranks));
     memcpy(&rasRanks[rank].addr, &bootstrapNetIfAddr, sizeof(rasRanks[rank].addr));
     rasRanks[rank].pid = getpid();
+    // bootstrapInit 记录的是 GPU 级信息，而非纯进程级：
     rasRanks[rank].cudaDev = comm->cudaDev;
     rasRanks[rank].nvmlDev = comm->nvmlDev;
     rasRanks[rank].hostHash = getHostHash();
@@ -754,9 +864,15 @@ ncclResult_t bootstrapInit(int nHandles, void* handles, struct ncclComm* comm) {
   }
 
   BOOTSTRAP_PROF_OPEN(timers[BOOTSTRAP_INIT_TIME_RING]);
+  // RING 阶段：一次 AllGather 交换所有信息
+  // 把四类数据打包成一个结构，沿环做 nranks-1 步的 ring AllGather。完成后每个 rank 都持有全局完整的 P2P / Proxy / UDS / RAS 表。
   NCCLCHECKGOTO(ringAllInfo(comm, state, state->peerP2pAddresses, state->peerProxyAddresses, state->peerProxyAddressesUDS, rasRanks), result, fail);
   BOOTSTRAP_PROF_CLOSE(timers[BOOTSTRAP_INIT_TIME_RING]);
 
+  // FINALIZE 阶段：Proxy 与 RAS 收尾
+  // ncclProxyInit：此刻已知全部 peer 的 Proxy 地址，创建服务端 Proxy。
+  // ncclRasAddRanks：注册所有 rank 的 RAS 信息（前提是本 rank RAS 初始化成功）。 
+  // 最后记录各阶段耗时并返回。
   // Create the service proxy and get the UDS
   NCCLCHECKGOTO(ncclProxyInit(comm, proxySocket, state->peerProxyAddresses, state->peerProxyAddressesUDS), result, fail);
 

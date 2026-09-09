@@ -24,6 +24,10 @@ __thread bool ncclGroupJobAbortFlag = false;
 
 void* ncclAsyncJobMain(void* arg);
 
+
+//  NCCL 异步任务调度系统的核心入口。它决定一个任务（job）是立即同步执行，还是延迟到 ncclGroupEnd 时批量执行。
+// 同步模式	不在 ncclGroupStart/End 范围内	任务立即执行，调用者阻塞等待完成
+// 异步/分组模式	在 ncclGroupStart/End 范围内	任务加入队列，ncclGroupEnd 时批量执行
 ncclResult_t ncclAsyncLaunch(
     struct ncclAsyncJob* job,
     ncclResult_t(*func)(struct ncclAsyncJob*),
@@ -33,11 +37,12 @@ ncclResult_t ncclAsyncLaunch(
   ncclResult_t ret = ncclSuccess;
 
   job->destroyFlag = comm->destroyFlag;
-  if (ncclGroupDepth == 0) {
-    ret = func(job);
-    if (ret != ncclSuccess && undo) undo(job);
-    if (destructor) destructor(job);
-  } else {
+  //   判断: ncclGroupDepth == 0 ?  (是否在 ncclGroupStart/End 作用域内)          
+  if (ncclGroupDepth == 0) { // 同步路径  典型场景：直接调用 ncclCommInitRank 而不包裹在 ncclGroupStart/End 中。 生命周期：函数返回时，job 已执行完毕并销毁，调用者同步等待。
+    ret = func(job); // 直接执行任务
+    if (ret != ncclSuccess && undo) undo(job); // 失败 → 回滚
+    if (destructor) destructor(job); // 无论成败 → 析构
+  } else {  // 异步路径   
     job->func = func;
     job->undo = undo;
     job->destructor = destructor;
@@ -49,16 +54,16 @@ ncclResult_t ncclAsyncLaunch(
     job->comm = comm;
     /* check if there are blocking and nonblocking comms at the same time in group. */
     if (comm->destroyFlag) {
-      ncclGroupBlocking = 1;
+      ncclGroupBlocking = 1;  // 正在销毁 → 强制阻塞
     } else if (ncclGroupBlocking == -1) {
       /* first met communicator */
-      ncclGroupBlocking = comm->config.blocking;
-    } else if (ncclGroupBlocking != comm->config.blocking) {
+      ncclGroupBlocking = comm->config.blocking;  // 首次遇到的通信器，设置组的阻塞模式
+    } else if (ncclGroupBlocking != comm->config.blocking) {  // 遇到与组阻塞模式不同的通信器
       WARN("Blocking and nonblocking communicators are not allowed in the same group.");
       ret = ncclInvalidArgument;
     }
     if (ret == ncclSuccess) {
-      ncclIntruQueueEnqueue(&ncclAsyncJobs, job);
+      ncclIntruQueueEnqueue(&ncclAsyncJobs, job); // 加入线程本地队列
     } else {
       // no need to undo, the job hasn't run
       if (destructor) destructor(job);

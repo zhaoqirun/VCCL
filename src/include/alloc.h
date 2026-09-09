@@ -144,6 +144,8 @@ ncclResult_t ncclCallocDebug(T** ptr, size_t nelem, const char *filefunc, int li
   }
   return ncclSuccess;
 }
+// 典型的 调试包装宏
+// 调用者只需传两个参数：ncclCalloc(ptr, nelem) —— 一个指向指针的指针 + 元素个数。宏自动追加文件名和行号：__VA_ARGS__ 展开为用户传入的两个参数，然后 __FILE__ 和 __LINE__ 被自动拼接为第3、第4个参数，传给 ncclCallocDebu
 #define ncclCalloc(...) ncclCallocDebug(__VA_ARGS__, __FILE__, __LINE__)
 
 template <typename T>

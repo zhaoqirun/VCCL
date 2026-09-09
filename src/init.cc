@@ -1374,6 +1374,118 @@ fail:
 }
 
 // &&&
+// ncclCommInitRankFunc(job_)
+//        │
+//        ▼
+// ┌──────────────────────────────────────────────────┐
+// │ ① CUDA 设备准备                                   │
+// │   - cudaSetDevice(cudaDev)    ← 切换到目标 GPU    │
+// │   - cudaDeviceGetAttribute    ← 获取计算能力       │
+// │     (archMajor, archMinor, maxSharedMem)          │
+// │   - cudaArch = 100*archMajor + 10*archMinor       │
+// │     例如: A100 → 800, H100 → 900, B200 → 1000    │
+// └──────────────────────┬───────────────────────────┘
+//                        │
+//                        ▼
+// ┌──────────────────────────────────────────────────┐
+// │ ② NCCL Kernel 初始化                              │
+// │   - ncclInitKernelsForDevice(cudaArch, ...)       │
+// │     ← 为当前 GPU 架构加载/编译 CUDA kernel         │
+// │   - 如果开启了 SetStackSize 环境变量:              │
+// │     cudaDeviceSetLimit(cudaLimitStackSize, ...)   │
+// │     ← 预设置 kernel 栈大小，避免 CUDA 运行时重配置   │
+// └──────────────────────┬───────────────────────────┘
+//                        │
+//                        ▼
+// ┌──────────────────────────────────────────────────┐
+// │ ③ 分支: 是 ncclCommSplit 还是 ncclCommInitRank?  │
+// │                                                   │
+// │ 判断: job->parent != NULL?                        │
+// └──────────────────────┬───────────────────────────┘
+//                        │
+//          ┌─────────────┴─────────────┐
+//          ▼                           ▼
+//     ┌──────────────┐          ┌──────────────────┐
+//     │ Split 路径    │          │ InitRank 路径     │
+//     │              │          │                  │
+//     │ ① commGet    │          │ ① commAlloc      │
+//     │   SplitInfo   │          │   (无父 comm)    │
+//     │   ← 计算当前  │          │                  │
+//     │   的 nranks,  │          │ ② 哈希计算:      │
+//     │   myrank     │          │   getHash(commId) │
+//     │              │          │                  │
+//     │ ② 如果 color │          │ ③ bootstrapInit  │
+//     │   == NOCOLOR │          │   ← 通过 bootstrap│
+//     │   → 直接退出 │          │   建立多节点握手   │
+//     │   (不创建子  │          │                  │
+//     │    comm)     │          │                  │
+//     │              │          │                  │
+//     │ ③ commAlloc  │          │                  │
+//     │   (继承父)   │          │                  │
+//     │              │          │                  │
+//     │ ④ 哈希计算:  │          │                  │
+//     │   eatHash(   │          │                  │
+//     │   父hash,    │          │                  │
+//     │   splitCount,│          │                  │
+//     │   color)     │          │                  │
+//     │              │          │                  │
+//     │ ⑤ bootstrap  │          │                  │
+//     │   Split      │          │                  │
+//     │   ← 基于父   │          │                  │
+//     │   通信器重连 │          │                  │
+//     └──────┬───────┘          └────────┬─────────┘
+//            │                          │
+//            └──────────┬───────────────┘
+//                       ▼
+// ┌──────────────────────────────────────────────────┐
+// │ ④ 通用初始化路径（两个分支汇合点）                   │
+// │                                                   │
+// │   initTransportsRank(comm, parent, timers)        │
+// │   ← 核心传输层初始化：                              │
+// │      ├── 拓扑发现 (topo detection)                 │
+// │      ├── AllGather 数据交换 (rank 间信息收集)        │
+// │      ├── 图算法选择 (Ring/Tree 等拓扑图构建)        │
+// │      └── 连接建立 (P2P/NET/SHM 传输通道)           │
+// │                                                   │
+// │   ncclTunerPluginLoad(comm)                       │
+// │   ← 加载调优插件                                   │
+// │   if (comm->tuner)                                │
+// │     comm->tuner->init(...)                        │
+// │     ← 初始化调优器上下文                            │
+// └──────────────────────┬───────────────────────────┘
+//                        │
+//                        ▼
+// ┌──────────────────────────────────────────────────┐
+// │ ⑤ 收尾工作                                       │
+// │                                                   │
+// │   comm->initState = ncclSuccess  ← 标记初始化完成  │
+// │                                                   │
+// │   Split 分支特殊处理:                              │
+// │   __atomic_store_n(&parent->childAbortFlag, NULL)  │
+// │   ← 解除子 comm 对父 comm 的中止标志引用           │
+// │                                                   │
+// │   输出计时日志 (Init timings)                       │
+// │   ├── kernels: kernel 加载时间                     │
+// │   ├── alloc: 内存分配时间                          │
+// │   ├── bootstrap: 多节点握手时间                     │
+// │   ├── allgathers: 数据交换时间                      │
+// │   ├── topo: 拓扑发现时间                            │
+// │   ├── graphs: 图算法选择时间                        │
+// │   ├── connections: 连接建立时间                     │
+// │   └── total: 总耗时                                │
+// └──────────────────────┬───────────────────────────┘
+//                        │
+//                        ▼
+// exit:
+//   __atomic_store_n(job->newcomm, comm, __ATOMIC_RELEASE)
+//   ← 将初始化完成的 comm 原子写入用户指针
+//   ← 异步线程执行时，主线程通过此指针获取结果
+//   free(parentRanks)
+//   return res
+
+// fail:
+//   comm->initState = res  ← 记录失败状态
+//   goto exit
 static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   struct ncclCommInitRankAsyncJob* job = (struct ncclCommInitRankAsyncJob*)job_;
   ncclComm_t comm = job->comm;
@@ -1494,6 +1606,8 @@ fail:
     INFO(NCCL_ENV, "Comm config " fieldStr " set to " format, config->field); \
   }
 
+  // envConfigOverride 函数，负责用环境变量覆盖通信器的配置项。它是整个 NCCL 配置系统的最高优先级层。
+  // 	环境变量 > 用户代码配置 > 内置默认值
 static ncclResult_t envConfigOverride(ncclComm_t comm) {
   ncclResult_t ret = ncclSuccess;
   const char* tmpNetName = comm->config.netName;
@@ -1508,7 +1622,7 @@ static ncclResult_t envConfigOverride(ncclComm_t comm) {
   blockingEnv = ncclParamCommBlocking();
   if (blockingEnv == 0 || blockingEnv == 1)
     comm->config.blocking = blockingEnv;
-
+  // 覆盖 cgaClusterSize（CGA 簇大小）
   cgaClusterSizeEnv = ncclParamCGAClusterSize();
   if (0 <= cgaClusterSizeEnv && cgaClusterSizeEnv <= NCCL_MAX_CGA_CLUSTER_SIZE) {
     comm->config.cgaClusterSize = cgaClusterSizeEnv;
@@ -1590,15 +1704,18 @@ static ncclResult_t parseCommConfig(ncclComm_t comm, ncclConfig_t *config) {
   internalConfig.magic = 0;
   internalConfigPtr = &internalConfig;
   if (config) {
+    // ncclConfig_t 的第一个成员是 size_t size（结构体大小）。先从用户传入的配置中读取 size 字段，然后取 min(用户声明的大小, 实际 sizeof(ncclConfig_t)) 来复制。这样做的目的是向前兼容——如果用户使用更新的 NCCL 头文件编译，传入的 ncclConfig_t 比当前 NCCL 库预期的更大，也不会越界复制
     memcpy((void*)&realSize, (void*)config, sizeof(size_t));
     realSize = realSize > sizeof(ncclConfig_t) ? sizeof(ncclConfig_t) : realSize;
     memcpy((void*)internalConfigPtr, (void*)config, realSize);
+    // magic 字段必须等于 0xcafebeef，这个魔数确保用户确实通过 NCCL_CONFIG_INITIALIZER 宏初始化了配置结构体，而不是使用未初始化的栈变量。
     if (internalConfigPtr->magic != 0xcafebeef) {
       WARN("ncclConfig_t argument not initialized via NCCL_CONFIG_INITIALIZER");
       ret = ncclInvalidArgument;
       goto fail;
     }
 
+    // 如果用户程序是用旧版本 NCCL 头文件编译的，新版本引入的字段对用户不可见（会被视为未定义），这里统一回退到默认值
     /* check version. */
     if (internalConfigPtr->version < NCCL_VERSION(2, 14, 0)) {
       internalConfigPtr->blocking = defaultConfig.blocking;
@@ -1625,6 +1742,7 @@ static ncclResult_t parseCommConfig(ncclComm_t comm, ncclConfig_t *config) {
     goto fail;
   }
 
+  // CTAs = Cooperative Thread Arrays，CUDA 中的线程块概念。这里的 minCTAs / maxCTAs 控制了 NCCL kernel 在 GPU 上启动时的最小/最大线程块数量，直接影响集合通信的并行度。
   if ((internalConfigPtr->minCTAs != NCCL_CONFIG_UNDEF_INT &&
     internalConfigPtr->minCTAs <= 0) ||
     (internalConfigPtr->maxCTAs != NCCL_CONFIG_UNDEF_INT &&
@@ -1635,12 +1753,14 @@ static ncclResult_t parseCommConfig(ncclComm_t comm, ncclConfig_t *config) {
     goto fail;
   }
 
+  // splitShare 只能是三个取值之一：NCCL_CONFIG_UNDEF_INT（未定义，稍后填充默认值）、0（不共享资源）、1（共享资源）、任何其他值 → 非法参数错误。
   if (internalConfigPtr->splitShare != NCCL_CONFIG_UNDEF_INT && internalConfigPtr->splitShare != 0 && internalConfigPtr->splitShare != 1) {
     WARN("Invalid config splitShare attribute value %d", internalConfigPtr->splitShare);
     ret = ncclInvalidArgument;
     goto fail;
   }
 
+  // NCCL_CONFIG_DEFAULT 宏的功能：如果用户未定义（值为 NCCL_CONFIG_UNDEF_INT 或 NCCL_CONFIG_UNDEF_PTR），则替换为默认值，否则保持用户设置的值不变。
   /* default config value can be tuned on different platform. */
   NCCL_CONFIG_DEFAULT(internalConfigPtr, blocking, NCCL_CONFIG_UNDEF_INT, 1, "Blocking", "%d");
   NCCL_CONFIG_DEFAULT(internalConfigPtr, cgaClusterSize, NCCL_CONFIG_UNDEF_INT, 4, "CGA cluster size", "%d");
@@ -1673,27 +1793,41 @@ static void ncclCommInitJobFree(void* _job) {
   free(_job);
 }
 
-// ……………………2
+// ……………………2ncclCommInitRankDev 
+// 是 NCCL 所有 communicator 初始化 API 的最终汇聚点。ncclCommInitRank、ncclCommInitAll、ncclCommInitRankConfig、ncclCommInitRankScalable 最终都调用它。
+// 它的职责是：参数校验 → 分配 comm → 解析配置 → 必要时启动 Root → 提交异步初始化 job
+// 注意它本身不做真正的组网——那些放在异步 job ncclCommInitRankFunc 里，本函数只做准备和分发。
+// 是初始化的“调度中枢”——它统一完成校验、内存分配、配置解析、按需启动 Root，然后把真正耗时的组网工作打包成异步 job 交出去，自身快速返回以支持非阻塞初始化
 static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, int nId, ncclUniqueId* commId, int myrank, int cudaDev, ncclConfig_t *config, const char funcName[]) {
+  // nId 必须在 [1, nranks] 之间——Root 数不能超过 rank 数，也不能为 0。
   if (nId <= 0 || nId > nranks) {
     WARN("improper usage of ncclCommInitRank: nId = %d, nranks=%d", nId, nranks);
     return ncclInvalidArgument;
   }
+  // 返回值，初始为 ncclSuccess，后续任何步骤失败都会跳转到 fail 标签修改它
   ncclResult_t res = ncclSuccess;
+  // 用于读取环境变量 NCCL_COMM_ID（后文使用），判断是否手动指定了 bootstrap 地址
   const char* commIdEnv = NULL;
+  // 待初始化的通信域（communicator），后续通过 ncclCalloc 分配
   ncclComm_t comm = NULL;
+  // 异步任务结构体，封装初始化所需的所有参数，交给后台线程执行
   struct ncclCommInitRankAsyncJob* job = NULL;
   bool launchedJob = false;
-  // first call ncclInit, this will setup the environment
+  // first call ncclInit, this will setup the environment 
   NCCLCHECKGOTO(ncclInit(), res, fail);
 
+  // 调试级别 > WARN：任何 rank 都打印  
+  // 调试级别非 NONE 且当前是 rank 0：只有 rank 0 打印，避免多进程刷屏
   if (ncclDebugLevel > NCCL_LOG_WARN || (ncclDebugLevel != NCCL_LOG_NONE && myrank == 0)) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, showVersion);
   }
-  // Make sure the CUDA runtime is initialized.
+  // CUDA Runtime 采用惰性初始化（lazy initialization），只有在第一次调用 CUDA API 时才会真正初始化驱动、创建 primary context 等
+  // cudaFree(NULL) 是一个合法的空操作（对 NULL 指针 free 是 no-op），但它会触发 CUDA Runtime 的初始化流程
+  // Make sure the CUDA runtime is initialized.  cudaFree(NULL) 是惯用技巧，强制 CUDA runtime 完成惰性初始化
   CUDACHECKGOTO(cudaFree(NULL), res, fail);
 
+  // 参数合法性 检查指针非空、myrank 在合法范围。
   NCCLCHECKGOTO(PtrCheck(newcomm, "CommInitRank", "newcomm"), res, fail);
   NCCLCHECKGOTO(PtrCheck(config, "CommInitRank", "config"), res, fail);
   if (nranks < 1 || myrank < 0 || myrank >= nranks) {
@@ -1702,17 +1836,24 @@ static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, int nId
     goto fail;
   }
 
+  // 分配 comm 及关键字段
+  // abortFlag / abortFlagDev：主机侧和设备侧的中止标志。设备侧用 ncclCudaHostCalloc 分配 pinned 内存，让 GPU kernel 也能读到中止信号。
+  // startMagic / endMagic：包裹 comm 结构的哨兵值，用于检测内存越界/损坏。
+  // abortFlagRefCount：多个 comm（如 split 共享）可能引用同一 abortFlag，引用计数管理释放。
   NCCLCHECKGOTO(ncclCalloc(&comm, 1), res, fail);
   NCCLCHECKGOTO(ncclCalloc(&comm->abortFlag, 1), res, fail);
   NCCLCHECKGOTO(ncclCudaHostCalloc(&comm->abortFlagDev, 1), res, fail);
   NCCLCHECKGOTO(ncclCalloc(&comm->abortFlagRefCount, 1), res, fail);
   comm->startMagic = comm->endMagic = NCCL_MAGIC; // Used to detect comm corruption.
   *comm->abortFlagRefCount = 1;
+
+  // 解析配置并置初始状态
   NCCLCHECKGOTO(parseCommConfig(comm, config), res, fail);
   /* start with ncclInProgress and will be changed to ncclSuccess if init succeeds. */
   comm->initState = ncclInProgress;
   *newcomm = comm;
 
+  // 准备异步 job  把初始化所需的所有参数打包进 ncclCommInitRankAsyncJob，供后台线程使用
   comm->groupHash = (unsigned long long)getHash(commId->internal, NCCL_UNIQUE_ID_BYTES);
   NCCLCHECKGOTO(ncclCalloc(&job, 1), res, fail);
   job->nId = nId;
@@ -1721,6 +1862,11 @@ static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, int nId
   job->myrank = myrank;
   job->cudaDev = cudaDev;
   snprintf(job->funcName, NCCL_COMMINIT_FUNCNAME_LEN, "%s", funcName);
+  // 拷贝 commId（对齐修正）  
+  // 用户传入的 commIds 数组可能位于用户的内存空间中。如果在异步通信（async commInit）过程中直接引用这块内存，用户可能会在异步操作完成前修改或释放这块内存，导致数据竞争或访问已释放的内存。通过将其拷贝到由系统/库自己控制的内存中，可以确保异步操作拥有独立、安全的数据副本，不受后续用户操作的影响。
+  // 在C++中，不同的结构体或类对内存对齐的要求不同。注释指出，ncclUniqueId 和 ncclBootstrapHandle 的对齐要求不同。
+    // 用户提供的数组是按 ncclUniqueId 的对齐方式分配的，如果直接通过 reinterpret_cast 等强制类型转换将其当作 ncclBootstrapHandle 来使用，由于底层数据可能没有满足 ncclBootstrapHandle 的对齐要求，会导致未定义行为，在某些硬件架构上甚至会引发总线错误或程序崩溃。
+    // 通过将数据拷贝到新分配的内存（如通过 new 或 malloc 分配的内存），标准保证了新分配的内存对于任何标准数据类型都是正确对齐的，从而彻底消除了对齐不匹配的风险。
   // need to copy the commIds to allow async commInit and to avoid alignement issues when casting from ncclUNiqueId and ncclBootstrapHandle
   // ncclUniqueIds and ncclBootstrapHandle don't have the same alignment requirements.
   // Therefore the array of Ids coming from the user might not be properly aligned to be cast into a ncclBootstrapHandle
@@ -1728,6 +1874,8 @@ static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, int nId
   NCCLCHECKGOTO(ncclCalloc(&job->commId, nId), res, fail);
   memcpy(job->commId, commId, nId * NCCL_UNIQUE_ID_BYTES);
 
+  // 当用户通过环境变量 NCCL_COMM_ID 指定固定地址时，只有 rank 0 负责在本地启动 bootstrap Root 服务线程（bootstrap.cc:497）。
+  // 这样其它 rank 才能连过来握手。多 uniqueId 与该模式不兼容，强制降为 1。
   commIdEnv = ncclGetEnv("NCCL_COMM_ID");
   if (commIdEnv && myrank == 0) {
     INFO(NCCL_ENV, "NCCL_COMM_ID set by environment to %s", commIdEnv);
@@ -1739,7 +1887,7 @@ static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, int nId
     NCCLCHECKGOTO(bootstrapCreateRoot((struct ncclBootstrapHandle*)&job->commId[0], true), res, fail);
   }
   launchedJob = true;
-  // **** 3
+  // **** 3  提交异步执行 真正的 commAlloc、bootstrapInit、initTransportsRank 都在那里执行。ncclCommInitJobFree 是 job 的清理回调。launchedJob 标志用于错误路径判断 job 所有权是否已移交。
   NCCLCHECKGOTO(ncclAsyncLaunch((struct ncclAsyncJob*)job, ncclCommInitRankFunc, NULL, ncclCommInitJobFree, comm), res, fail);
 
 exit:
@@ -1755,19 +1903,26 @@ fail:
   if (newcomm) *newcomm = NULL;
   goto exit;
 }
-// !!!!!!!!!!!!!!!!!! 重要的调用函数    
+// !!!!!!!!!!!!!!!!!! 重要的调用函数    标准多进程初始化
+// 每个进程独立调用，传入同一个 ncclUniqueId，各自指定自己的 myrank。nId=1，只有一个 commId。
 NCCL_API(ncclResult_t, ncclCommInitRank, ncclComm_t* newcomm, int nranks, ncclUniqueId commId, int myrank);
 ncclResult_t ncclCommInitRank(ncclComm_t* newcomm, int nranks, ncclUniqueId commId, int myrank) {
+  // 开启一个 NVTX range，供 Nsight 等工具做 profiling，标记 ncclCommInitRank 的执行区间。不影响功能。
   NVTX3_RANGE(NcclNvtxParamsCommInitRank)
   // Load the CUDA driver and dlsym hooks (can fail on old drivers)
   (void)ncclCudaLibraryInit();
 
   int cudaDev;
+  // config 用默认配置初始化（NCCL_CONFIG_INITIALIZER 会设置 magic 校验等）。ncclCommInitRank 不接受用户自定义配置，如需自定义要用 ncclCommInitRankConfig
   ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
+  // cudaGetDevice 取当前线程绑定的 GPU 号。这意味着调用前用户必须先 cudaSetDevice 选好本 rank 对应的 GPU。
   CUDACHECK(cudaGetDevice(&cudaDev));
   //  从这里开始调用网络插件的初始化函数 ncclCommInitRankDev
+  // 注意第 3 个参数 nId = 1——表示只有一个 ncclUniqueId（单 Root）。这是与可扩展版 ncclCommInitRankScalable（nId 可 > 1）的关键区别。
   NCCLCHECK(ncclCommInitRankDev(newcomm, nranks, 1, &commId, myrank, cudaDev, &config, __func__));
 
+  // 记录 NVTX payload
+  // 把 commHash、nranks、myrank、cudaDev 附加到 NVTX range，便于 profiling 时区分不同 communicator
   NVTX3_RANGE_ADD_PAYLOAD(CommInitRank, NcclNvtxParamsCommInitRankSchema,
     NVTX3_PAYLOAD((*newcomm)->commHash, nranks, myrank, cudaDev));
 
@@ -1775,6 +1930,10 @@ ncclResult_t ncclCommInitRank(ncclComm_t* newcomm, int nranks, ncclUniqueId comm
 }
 
 NCCL_API(ncclResult_t, ncclCommInitAll, ncclComm_t* comms, int ndev, const int* devlist);
+// 这是单进程多 GPU 场景的便捷 API。内部自动：
+// 调用 ncclGetUniqueId 生成一个 ID
+// 用 ncclGroupStart/End 包裹，对每个 GPU 设备调用一次 ncclCommInitRankDev
+// 所有 4 个 communicator 共享同一个 uniqueId，但 myrank 分别为 0,1,2,3
 ncclResult_t ncclCommInitAll(ncclComm_t* comms, int ndev, const int* devlist) {
   ncclResult_t ret = ncclSuccess;
   int totalnDev;
@@ -1851,6 +2010,7 @@ ncclResult_t ncclCommSetAsyncError(ncclComm_t comm, ncclResult_t nextState) {
 }
 
 NCCL_API(ncclResult_t, ncclCommInitRankConfig, ncclComm_t* comm, int nranks, ncclUniqueId commId, int myrank, ncclConfig_t *config);
+// 带配置的初始化 场景 1 类似，但允许用户传入自定义配置（如阻塞/非阻塞模式、网络名称等）。nId=1。
 ncclResult_t ncclCommInitRankConfig(ncclComm_t *newcomm, int nranks, ncclUniqueId commId, int myrank, ncclConfig_t *config) {
   int cudaDev;
   ncclResult_t ret = ncclSuccess;
@@ -1887,6 +2047,8 @@ fail:
 }
 
 NCCL_API(ncclResult_t, ncclCommInitRankScalable, ncclComm_t* newcomm, int nranks, int myrank, int nId, ncclUniqueId* commId, ncclConfig_t* config);
+// 可扩展初始化
+// 这是大规模训练场景的优化 API。与场景 1 的关键区别是 nId 可以大于 1，传入多个 ncclUniqueId，允许多个 bootstrap 根节点并行处理连接，避免单一 bootstrap 服务器成为瓶颈。每个 rank 根据自己的 myrank 连接到对应的 bootstrap 根。
 ncclResult_t ncclCommInitRankScalable(ncclComm_t* newcomm, int nranks, int myrank, int nId, ncclUniqueId* commId, ncclConfig_t* config) {
   NVTX3_RANGE(NcclNvtxParamsCommInitRankScalable);
 

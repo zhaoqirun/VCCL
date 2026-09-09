@@ -424,8 +424,20 @@ struct ncclKernelPlanner {
 #define NCCL_MAGIC 0x0280028002800280 // Nickel atomic number is 28.
 
 struct ncclComm {
+  // 结构体起始标记，用于检测内存越界/损坏
   uint64_t startMagic;
-  struct ncclMemoryStack memPermanent, memScoped;
+  // 成员	类型	说明
+  // memPermanent	ncclMemoryStack	永久内存栈，整个 comm 生命周期内分配的内存
+  // memScoped	ncclMemoryStack	作用域内存栈，可重置释放的临时内存
+  // destructorHead	ncclDestructor*	析构函数链表头，comm 销毁时依次调用
+  // memPool_ncclTaskColl	ncclMemoryPool	集合任务（collective task）对象内存池
+  // memPool_ncclTaskP2p	ncclMemoryPool	P2P 任务对象内存池
+  // memPool_ncclProxyOp	ncclMemoryPool	Proxy 操作对象内存池
+  // memPool_ncclKernelPlan	ncclMemoryPool	Kernel 计划对象内存池
+  // memPool_ncclPsmSelfCopy	ncclMemoryPool	PSM 自拷贝对象内存池
+  // memPool	cudaMemPool_t	CUDA 内存池（cudaMemPool）句柄
+  // regCache	ncclRegCache	缓冲区注册缓存，用于加速内存注册
+  struct ncclMemoryStack memPermanent, memScoped;  
   // List of destructors to run when comm is destructed
   struct ncclDestructor* destructorHead;
 
@@ -456,6 +468,7 @@ struct ncclComm {
   bool directMode;
   int cuMemSupport;
 
+  // 网络通信的魔数，用于检测通信双方的版本/协议不匹配
   uint64_t magic; // Magic number for all network communication. Not a security key -- only goal is to detect mismatches.
 
   const char* commName;

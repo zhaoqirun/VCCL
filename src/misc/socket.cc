@@ -431,7 +431,9 @@ int ncclFindInterfaces(char* ifNames, union ncclSocketAddress *ifAddrs, int ifNa
   return nIfs;
 }
 
+// NCCL 中 Socket 进入监听模式的核心函数。它将一个已创建 fd 的 Socket 绑定到指定地址、获取实际端口号、并开始监听连接
 ncclResult_t ncclSocketListen(struct ncclSocket* sock) {
+  // sock->fd 必须已经由 ncclSocketInit 创建好（调用 socket() 系统调用得到有效文件描述符）
   if (sock == NULL) {
     WARN("ncclSocketListen: pass NULL socket");
     return ncclInvalidArgument;
@@ -441,6 +443,7 @@ ncclResult_t ncclSocketListen(struct ncclSocket* sock) {
     return ncclInvalidArgument;
   }
 
+  // 端口复用设置（仅当端口被环境变量强制指定时） 设置SO_REUSEADDR/SO_REUSEPORT  socketToPort 提取 sock->addr 中的端口号：
   if (socketToPort(&sock->addr)) {
     // Port is forced by env. Make sure we get the port.
     int opt = 1;
@@ -450,6 +453,8 @@ ncclResult_t ncclSocketListen(struct ncclSocket* sock) {
 #endif
   }
 
+  // bind 之后立即调用 getsockname 获取实际绑定的地址。当端口号为 0 时，操作系统会分配一个随机可用端口，getsockname 会把这个实际端口号写回 sock->addr。
+  // 这样调用者（如 bootstrapCreateRoot）就能拿到真实的地址，分发给其他进程。
   // addr port should be 0 (Any port)
   SYSCHECK(bind(sock->fd, &sock->addr.sa, sock->salen), "bind");
 
@@ -465,16 +470,20 @@ ncclResult_t ncclSocketListen(struct ncclSocket* sock) {
   /* Put the socket in listen mode
    * NB: The backlog will be silently truncated to the value in /proc/sys/net/core/somaxconn
    */
+  // 将 Socket 从 CLOSED 状态转换为 LISTEN 状态，内核开始维护两个队列（SYN 队列 + Accept 队列）
+  // backlog = 16384：指定 Accept 队列的最大长度。注释特别说明：实际值会被静默截断到
   SYSCHECK(listen(sock->fd, 16384), "listen");
   sock->state = ncclSocketStateReady;
   return ncclSuccess;
 }
 
+// 将 Socket 的实际地址拷贝出来，供外部使用。
 ncclResult_t ncclSocketGetAddr(struct ncclSocket* sock, union ncclSocketAddress* addr) {
   if (sock == NULL) {
     WARN("ncclSocketGetAddr: pass NULL socket");
     return ncclInvalidArgument;
   }
+  // 状态检查：只有 Ready 状态的 Socket 才能获取地址
   if (sock->state != ncclSocketStateReady) return ncclInternalError;
   memcpy(addr, &sock->addr, sizeof(union ncclSocketAddress));
   return ncclSuccess;

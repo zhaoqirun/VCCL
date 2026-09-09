@@ -28,6 +28,7 @@ extern ncclCollNet_t* getNcclCollNet_v9(void* netPluginLib);
 extern ncclCollNet_t* getNcclCollNet_v10(void* netPluginLib);
 
 static pthread_mutex_t netLock = PTHREAD_MUTEX_INITIALIZER;
+//三个插槽的优先级从高到低: 第三方插件    InfiniBand   TCP Socket
 ncclNet_t* ncclNets[NCCL_NET_MAX_PLUGINS] = { nullptr, &ncclNetIb, &ncclNetSocket };
 static int ncclNetsVer[NCCL_NET_MAX_PLUGINS] = { -1, 10, 10 };
 ncclCollNet_t* ncclCollNets[NCCL_NET_MAX_PLUGINS] = { nullptr, nullptr, nullptr };
@@ -66,12 +67,13 @@ ncclResult_t ncclNetPluginLoad(struct ncclComm* comm) {
     ++netPluginRefCount;
     goto exit;
   }
-
+// 通过环境变量 NCCL_NET_PLUGIN 指定的路径，打开第三方网络插件的动态库（Linux 下为 .so，Windows 下为 .dll）。
+// 如果环境变量未设置或打开失败，跳到 fail 标签。
   netPluginLib = ncclOpenNetPluginLib(ncclGetEnv("NCCL_NET_PLUGIN"));
   if (netPluginLib == nullptr) {
     goto fail;
   }
-
+// 版本降级探测（v10 → v6）
   ncclNets[0] = getNcclNet_v10(netPluginLib);
   if (ncclNets[0]) ncclNetsVer[0] = 10;
   if (ncclNets[0] == nullptr) {
@@ -97,8 +99,9 @@ ncclResult_t ncclNetPluginLoad(struct ncclComm* comm) {
   if (ncclNets[0] == nullptr) {
     goto fail;
   }
-
-  // Check for CollNet
+// CollNet（Collective Network）是 NCCL 中用于加速集合通信操作（如 AllReduce）的硬件卸载机制。不是所有插件都支持 CollNet，
+// 所以这里 ncclCollNets[0] 为 nullptr 也是允许的（不会导致失败）。
+  // Check for CollNet 
   ncclCollNets[0] = getNcclCollNet_v10(netPluginLib);
   if (ncclCollNets[0] == nullptr) {
     ncclCollNets[0] = getNcclCollNet_v9(netPluginLib);
@@ -205,23 +208,27 @@ ncclResult_t ncclNetInit(struct ncclComm* comm) {
   bool ok = false;
 
   netName = comm->config.netName;
+  // ncclNet_t* ncclNets[NCCL_NET_MAX_PLUGINS] = { nullptr, &ncclNetIb, &ncclNetSocket };
+  // 从 i=0（插件）→ i=1（IB）→ i=2（Socket）依次尝试，找到第一个满足条件的就 break，体现了优先级机制。
   for (int i=0; i<3; i++) {
     if (ncclNets[i] == nullptr) continue;
     enum ncclNetState state;
     // ----7
     NCCLCHECK(netGetState(i, &state));
+    // 状态检查   名称匹配   版本匹配
     if (state != ncclNetStateEnabled) continue;
     if (netName && strcasecmp(netName, ncclNets[i]->name) != 0) continue;
     if (ncclSuccess != ncclNetCheckDeviceVersion(comm, ncclNets[i], 0)) {
       // Mismatched device plugin version
       continue;
     }
-
+    // // 绑定网络传输层  // 记录版本号
     comm->ncclNet = ncclNets[i];
     comm->ncclNetVer = ncclNetsVer[i];
     ok = true;
 
     if (ncclCollNets[i]) {
+      // // 同样惰性初始化并检查状态
       NCCLCHECK(collNetGetState(i, &state));
       if (state == ncclNetStateEnabled) {
         comm->ncclCollNet = ncclCollNets[i];
@@ -230,6 +237,7 @@ ncclResult_t ncclNetInit(struct ncclComm* comm) {
     break;
   }
 
+  // 如果三个网络全部不满足条件，输出警告并返回 ncclInvalidUsage。
   if (!ok) {
     WARN("Error: network %s not found.", netName ? netName : "");
     return ncclInvalidUsage;

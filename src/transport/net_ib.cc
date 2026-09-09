@@ -584,19 +584,26 @@ ncclResult_t ncclIbMakeVDevice(int* d, ncclNetVDeviceProps_t* props) {
 
 static ncclProfilerCallback_t ncclProfilerFunction;
 
+// 该函数位于 net_ib.cc，是 NCCL 中 InfiniBand/RoCE 网络传输层的初始化入口。它在进程生命周期内只执行一次（通过 ncclNIbDevs == -1 守卫），负责发现、枚举、验证所有可用的 IB 设备及端口，并将它们注册到全局设备表中。
+// 重点关注的提交代码部分
 ncclResult_t ncclIbInit(ncclDebugLogger_t logFunction, ncclProfilerCallback_t profFunction) {
   ncclResult_t ret = ncclSuccess;
   ncclProfilerFunction = profFunction;
+  // / 环境变量禁用 IB，直接返回失败
   if (ncclParamIbDisable()) return ncclInternalError;
   static int shownIbHcaEnv = 0;
+  // 首先第三行通过wrap_ibv_symbols加载动态库libibverbs.so，然后获取动态库的各个函数
+  // wrap_ibv_symbols() 是 NCCL 的 libibverbs 动态符号包装机制——它通过 dlopen/dlsym 加载 IB verbs 库的所有函数指针，使得 NCCL 可以在没有 IB 驱动的系统上编译运行（只是 IB 功能不可用）。
   if(wrap_ibv_symbols() != ncclSuccess) { return ncclInternalError; }
-
+  // 一次性初始化守卫
   if (ncclNIbDevs == -1) {
     pthread_mutex_lock(&ncclIbLock);
+    // 然后通过wrap_ibv_fork_init避免fork引起rdma网卡读写出错
     wrap_ibv_fork_init();
     if (ncclNIbDevs == -1) {
       ncclNIbDevs = 0;
       ncclNMergedIbDevs = 0;
+      // 查找本地 IP 接口  找出本机用于 IB 通信的 IP 地址和网络接口名，这是后续 OOB（带外）通信的基础。
       if (ncclFindInterfaces(ncclIbIfName, &ncclIbIfAddr, MAX_IF_NAME_SIZE, 1) != 1) {
         WARN("NET/IB : No IP interface found.");
         ret = ncclInternalError;
@@ -606,7 +613,7 @@ ncclResult_t ncclIbInit(ncclDebugLogger_t logFunction, ncclProfilerCallback_t pr
       // Detect IB cards
       int nIbDevs;
       struct ibv_device** devices;
-
+      // 用户 HCA 过滤规则解析  ^ 前缀	黑名单：排除列出的 HCA  = 前缀	精确匹配：端口号也精确匹配
       // Check if user defined which IB device:port to use
       const char* userIbEnv = ncclGetEnv("NCCL_IB_HCA");
       if (userIbEnv != NULL && shownIbHcaEnv++ == 0) INFO(NCCL_NET|NCCL_ENV, "NCCL_IB_HCA set to %s", userIbEnv);
@@ -616,11 +623,12 @@ ncclResult_t ncclIbInit(ncclDebugLogger_t logFunction, ncclProfilerCallback_t pr
       bool searchExact = userIbEnv && userIbEnv[0] == '=';
       if (searchExact) userIbEnv++;
       int nUserIfs = parseStringList(userIbEnv, userIfs, MAX_IB_DEVS);
-
+      // 获取系统中所有 IB 设备列表
       if (ncclSuccess != wrap_ibv_get_device_list(&devices, &nIbDevs)) { ret = ncclInternalError; goto fail; }
 
       for (int d=0; d<nIbDevs && ncclNIbDevs<MAX_IB_DEVS; d++) {
         struct ibv_context * context;
+        //打开设备上下文
         if (ncclSuccess != wrap_ibv_open_device(&context, devices[d]) || context == NULL) {
           WARN("NET/IB : Unable to open device %s", devices[d]->name);
           continue;
@@ -628,6 +636,7 @@ ncclResult_t ncclIbInit(ncclDebugLogger_t logFunction, ncclProfilerCallback_t pr
         int nPorts = 0;
         struct ibv_device_attr devAttr;
         memset(&devAttr, 0, sizeof(devAttr));
+        // 查询设备属性
         if (ncclSuccess != wrap_ibv_query_device(context, &devAttr)) {
           WARN("NET/IB : Unable to query device %s", devices[d]->name);
           if (ncclSuccess != wrap_ibv_close_device(context)) { ret = ncclInternalError; goto fail; }
@@ -647,6 +656,7 @@ ncclResult_t ncclIbInit(ncclDebugLogger_t logFunction, ncclProfilerCallback_t pr
           if (! (matchIfList(devices[d]->name, port_num, userIfs, nUserIfs, searchExact) ^ searchNot)) {
             continue;
           }
+          // 填充设备结构体
           pthread_mutex_init(&ncclIbDevs[ncclNIbDevs].lock, NULL);
           ncclIbDevs[ncclNIbDevs].device = d;
           ncclIbDevs[ncclNIbDevs].guid = devAttr.sys_image_guid;
@@ -665,6 +675,7 @@ ncclResult_t ncclIbInit(ncclDebugLogger_t logFunction, ncclProfilerCallback_t pr
           ncclIbDevs[ncclNIbDevs].mrCache.slots = NULL;
           NCCLCHECK(ncclIbStatsInit(&ncclIbDevs[ncclNIbDevs].stats));
 
+          // 自适应路由 (AR)
           // Enable ADAPTIVE_ROUTING by default on IB networks
           // But allow it to be overloaded by an env parameter
           ncclIbDevs[ncclNIbDevs].ar = (portAttr.link_layer == IBV_LINK_LAYER_INFINIBAND) ? 1 : 0;
@@ -673,15 +684,19 @@ ncclResult_t ncclIbInit(ncclDebugLogger_t logFunction, ncclProfilerCallback_t pr
           TRACE(NCCL_NET,"NET/IB: [%d] %s:%s:%d/%s speed=%d context=%p pciPath=%s ar=%d", d, devices[d]->name, devices[d]->dev_name, ncclIbDevs[ncclNIbDevs].portNum,
               NCCL_IB_LLSTR(portAttr.link_layer), ncclIbDevs[ncclNIbDevs].speed, context, ncclIbDevs[ncclNIbDevs].pciPath, ncclIbDevs[ncclNIbDevs].ar);
 
+          // 动态创建异步事件监听线程
+          // 为每个 IB 设备启动一个异步事件监听线程（见 ncclIbAsyncThreadMain），用于捕获 IB 硬件错误事件：
           PTHREADCHECKGOTO(pthread_create(&ncclIbAsyncThread, NULL, ncclIbAsyncThreadMain, ncclIbDevs + ncclNIbDevs), "pthread_create", ret, fail);
           ncclSetThreadName(ncclIbAsyncThread, "NCCL IbAsync %2d", ncclNIbDevs);
           PTHREADCHECKGOTO(pthread_detach(ncclIbAsyncThread), "pthread_detach", ret, fail); // will not be pthread_join()'d
 
           // Add this plain physical device to the list of virtual devices
+          // 为每个物理 IB 设备创建一个虚拟设备 
           int vDev;
           ncclNetVDeviceProps_t vProps = {0};
           vProps.ndevs = 1;
           vProps.devs[0] = ncclNIbDevs;
+          // 将物理设备包装为虚拟设备（vDevice），为后续多 NIC 聚合（bonding）提供统一的抽象层。
           NCCLCHECK(ncclIbMakeVDeviceInternal(&vDev, &vProps));
 
           ncclNIbDevs++;
@@ -696,6 +711,7 @@ ncclResult_t ncclIbInit(ncclDebugLogger_t logFunction, ncclProfilerCallback_t pr
       INFO(NCCL_INIT|NCCL_NET, "NET/IB : No device found.");
     }
 
+    // 汇总输出
     // Print out all net devices to the user (in the same format as before)
     char line[2048];
     line[0] = '\0';

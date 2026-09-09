@@ -97,6 +97,8 @@ NCCL_PARAM(IbMQpRetryTimeout, "IB_MQP_RETRY_SLEEP_MSEC", 100); // in millisecond
 #define IBV_MQP_RETRY_ERRNO_ALL(e) (ncclParamIbMQpRetryAll() ? (e != 0) : IBV_MQP_RETRY_ERRNO(e))
 
 ncclResult_t wrap_ibv_fork_init() {
+  // wrap_ibv_fork_init() 是对 RDMA libibverbs 中 ibv_fork_init() 的一层 NCCL 包装，作用是在进程可能调用 fork() 时，初始化 libibverbs 的 fork 安全支持。
+  // 这里的 ibvSymbols 是动态加载的 verbs 符号表。ibv_internal_fork_init 保存了真实 ibv_fork_init 函数的函数指针，因此实际调用等价于：int ret = ibvSymbols.ibv_internal_fork_init();
   IBV_INT_CHECK(ibvSymbols, ibv_internal_fork_init, ibv_internal_fork_init(), -1, "ibv_fork_init");
 }
 

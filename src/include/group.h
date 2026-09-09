@@ -28,19 +28,19 @@ typedef enum ncclGroupJobState {
 } ncclGroupJobState_t;
 
 struct ncclAsyncJob {
-  struct ncclAsyncJob* next;
-  pthread_t thread;
-  ncclResult_t result;
-  ncclResult_t(*func)(struct ncclAsyncJob*);
-  void(*undo)(struct ncclAsyncJob*);
-  void(*destructor)(void*);
+  struct ncclAsyncJob* next; // 链表指针（intrusive queue）
+  pthread_t thread;  // 执行线程
+  ncclResult_t result; // 执行结果
+  ncclResult_t(*func)(struct ncclAsyncJob*);  // 主执行函数
+  void(*undo)(struct ncclAsyncJob*);  // 回滚函数（失败时调用）
+  void(*destructor)(void*);  // 析构函数（无论成功/失败都调用）
   ncclGroupJobState_t state;
-  uint32_t* abortFlag; /* point to comm abortFlag */
-  uint32_t* abortFlagDev; /* point to comm abortFlagDev */
-  uint32_t* childAbortFlag; /* point to child abortFlag */
+  uint32_t* abortFlag; /* point to comm abortFlag */ // 中止标志（来自 comm）
+  uint32_t* abortFlagDev; /* point to comm abortFlagDev */ // 中止标志（来自 comm）
+  uint32_t* childAbortFlag; /* point to child abortFlag */  // 子任务中止标志（来自 comm）
   uint32_t* childAbortFlagDev; /* point to child abortFlagDev */
-  ncclComm_t comm;
-  int destroyFlag;
+  ncclComm_t comm; / 所属通信器
+  int destroyFlag;  // 销毁标志
 };
 
 ncclResult_t ncclAsyncLaunch(

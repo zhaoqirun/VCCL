@@ -11,8 +11,8 @@
 #include "comm.h"
 
 struct ncclBootstrapHandle {
-  uint64_t magic;
-  union ncclSocketAddress addr;
+  uint64_t magic;  // 魔数（唯一标识符）
+  union ncclSocketAddress addr;  // 套接字地址（用于网络通信）（IP + 端口）
 };
 static_assert(sizeof(struct ncclBootstrapHandle) <= sizeof(ncclUniqueId), "Bootstrap handle is too large to fit inside NCCL unique ID");
 
