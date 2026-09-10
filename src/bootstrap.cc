@@ -233,8 +233,8 @@ static ncclResult_t socketSendRecv(struct ncclSocket* sendSock, void* sendData, 
 }
 
 union ringConnectInfo {
-  union ncclSocketAddress addr;
-  char handle[NCCL_NET_HANDLE_MAXSIZE];
+  union ncclSocketAddress addr; // socket 模式用这个
+  char handle[NCCL_NET_HANDLE_MAXSIZE]; // net 模式用这个
 };
 
 struct extInfo {
@@ -512,7 +512,10 @@ struct bootstrapState {
   uint64_t magic;
   volatile uint32_t* abortFlag;
 };
+
+// ：STATE_LISTEN 和 STATE_RING 两个宏把代码里对 bootstrapState 的访问按"监听端点"和"环连接端点"两类语义分开，读代码时更容易区分当前在处理哪部分。
 #define STATE_RING(s, f) (s->ring.f)
+// 把 STATE_LISTEN(s, f) 替换成 (s->listen.f)，即"通过指针 s 访问其 listen 子结构里的字段 f
 #define STATE_LISTEN(s, f) (s->listen.f)
 
 // helper functions
@@ -530,31 +533,39 @@ static ncclResult_t getUDS(uint64_t* peerUDS) {
   return ncclSuccess;
 }
 #define MAX_OOB_DEVS 16
+
+
 static ncclResult_t netGetDevice(int rank, struct ncclComm* comm, int* dev) {
+  // 为 bootstrap 阶段的带外通信（OOB, Out-Of-Band）选择一个网络设备（网卡/HCA），并把设备号返回给调用方。
+  // 当 NCCL_OOB_NET_ENABLE=1（走网络插件模式）时，bootstrapInit 会调用它来决定用哪块网卡建立 ring 监听端点。
   static int devOOB = -1;
-  if (devOOB < 0) {
+  if (devOOB < 0) { // 进程级静态缓存，-1 表示尚未初始化
     pthread_mutex_lock(&bootstrapNetLock);
-    if (devOOB < 0) {
+    if (devOOB < 0) { // 双重检查锁定
+
+      // ...选择设备...
+      // 情况一：用户通过 NCCL_OOB_NET_IFNAME 指定网卡
       const char* userIfEnv = ncclGetEnv("NCCL_OOB_NET_IFNAME");
       if (userIfEnv && strlen(userIfEnv) > 0) {
         INFO(NCCL_BOOTSTRAP | NCCL_ENV, "NCCL_OOB_NET_IFNAME set to %s", userIfEnv);
-        bool searchNot = userIfEnv && userIfEnv[0] == '^';
+        bool searchNot = userIfEnv && userIfEnv[0] == '^';  // ^ 表示"排除"
         if (searchNot) userIfEnv++;
-        bool searchExact = userIfEnv && userIfEnv[0] == '=';
+        bool searchExact = userIfEnv && userIfEnv[0] == '='; // = 表示"精确匹配"
         if (searchExact) userIfEnv++;
+        //  解析设备列表并遍历匹配
         struct netIf userIfs[MAX_OOB_DEVS];
-        int nUserIfs = parseStringList(userIfEnv, userIfs, MAX_OOB_DEVS);
+        int nUserIfs = parseStringList(userIfEnv, userIfs, MAX_OOB_DEVS); // 逗号分隔的列表
         // loop over the device and return the first one matching
         int nDev = 0;
-        NCCLCHECK(comm->ncclNet->devices(&nDev));
+        NCCLCHECK(comm->ncclNet->devices(&nDev)); // 获取设备数量
         int devId = 0;
         while (devId < nDev) {
           ncclNetProperties_t props;
-          comm->ncclNet->getProperties(devId, &props);
+          comm->ncclNet->getProperties(devId, &props);  // 拿到设备名、端口等属性
           // check against user specified HCAs/ports
           if (matchIfList(props.name, props.port, userIfs, nUserIfs, searchExact) ^ searchNot) {
             // All plain physical devices have been initialized at this point
-            devOOB = devId;
+            devOOB = devId; // 找到第一个匹配的设备
             break;
           }
           devId++;
@@ -572,6 +583,7 @@ static ncclResult_t netGetDevice(int rank, struct ncclComm* comm, int* dev) {
         devOOB = 0;
       }
       // display info on the chosen device
+      // 输出类似 Bootstrap: Using mlx5_0:1，方便运维确认实际走的是哪块网卡。用 hasProp 兜底：万一 getProperties 失败也不崩，打印 N/A:-1。
       ncclNetProperties_t props;
       ncclResult_t res = comm->ncclNet->getProperties(devOOB, &props);
       bool hasProp = res == ncclSuccess;
@@ -745,16 +757,28 @@ ncclResult_t bootstrapInit(int nHandles, void* handles, struct ncclComm* comm) {
   memset(&nextPeer, 0, sizeof(union ringConnectInfo));
   BOOTSTRAP_PROF_OPEN(timers[BOOTSTRAP_INIT_TIME_CREATE]);
 
-  // 端点一：ring 监听端点（别的 rank 用它连我）。根据 OOB_NET_ENABLE 走网络插件或普通 socket，并把对外连接信息写入 info.connectInfo（union，两种模式分别用 handle 或 addr）。
-  if (ncclParamBootstrapNetEnable()) {
+  // 端点一：ring 监听端点（相邻的rank用它连我）。根据 OOB_NET_ENABLE 走网络插件或普通 socket，并把对外连接信息写入 info.connectInfo（union，两种模式分别用 handle 或 addr）。
+  // 分支A：网络插件模式（RDMA / IB / 自定义网络） 
+  if (ncclParamBootstrapNetEnable()) {  
+    // 通信底层	NCCL 网络插件（IB/RDMA verbs、自定义 net 插件） 监听方式	state->net->listen() 走插件接口
     // Create net interface for other ranks to contact me (all gather)
+
+    // 展开结果 (state->listen.net.dev)
+    // // netGetDevice 内部用一个 static int devOOB 做进程级缓存（配合互斥锁做懒初始化），会读取 NCCL_OOB_NET_IFNAME 来匹配
+    // 用户指定的网卡，默认则选设备 0。拿到设备后调用 state->net->listen(...)，通过 NCCL 网络插件（IB/RDMA verbs 或自定义 net 插件）
+    // 在该设备上开启监听，产出一个插件私有格式的**连接句柄（handle）**和一个监听 comm 对象（存入 net.comm）。
+    // 最后 memcpy(info.connectInfo.handle, ..., NCCL_NET_HANDLE_MAXSIZE) 把这个句柄拷进 info.connectInfo.handle——
+    // 注意 connectInfo 是一个 union ringConnectInfo，网络模式下使用其 handle 成员。
     NCCLCHECK(netGetDevice(rank, comm, &STATE_LISTEN(state, net.dev)));
     NCCLCHECK(state->net->listen(STATE_LISTEN(state, net.dev), STATE_LISTEN(state, net.handle), &STATE_LISTEN(state, net.comm)));
     memcpy(info.connectInfo.handle, STATE_LISTEN(state, net.handle), NCCL_NET_HANDLE_MAXSIZE);
-  } else {
+  } else { // 分支B：普通 TCP Socket 模式（默认）
     // create socket for ring neightbor to contact mee
+    // ncclSocketInit 用本地网卡地址和 magic 初始化 socket、ncclSocketListen 开始监听、ncclSocketGetAddr 把系统实际绑定的地址（含真实端口）回填到 info.connectInfo.addr
     NCCLCHECK(createListenSocket(comm, comm->magic, &STATE_LISTEN(state, socket), &info.connectInfo.addr, ncclSocketTypeBootstrap));
   }
+
+
   // 端点二：Root 回连端点。curr_root 是本 rank 所属 Root。用该 Root 的 magic 创建 listenSockRoot，地址写入 info.listenRootAddress，供 Root 稍后把 next rank 信息发回来
   int curr_root = rootIdFromRank(rank, nranks, nHandles);
   NCCLCHECK(createListenSocket(comm, BOOTSTRAP_HANDLE(handles, curr_root)->magic, &listenSockRoot, &info.listenRootAddress, ncclSocketTypeBootstrap));

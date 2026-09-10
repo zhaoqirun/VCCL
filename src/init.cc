@@ -689,6 +689,10 @@ NCCL_PARAM(MNNVLEnable, "MNNVL_ENABLE", 2);
 #define TIMER_INIT_ALLOC 7
 #define TIMERS_INIT_COUNT 8
 
+
+// 构建图
+// 第 0 层（入口）：initTransportsRank
+// 整体作用：这是通信器初始化的核心函数，负责一整套 rank 建链前的准备——AllGather 交换 peer 信息、拓扑探测与图计算（ring/tree/collnet/nvls）、节点划分、buffer 尺寸计算，最后按算法把各条通信路径真正连起来。
 static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* parent, uint64_t timers[TIMERS_INIT_COUNT]) {
   // We use 2 AllGathers
   // 1. { peerInfo, comm, compCap}
@@ -1168,9 +1172,10 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
   comm->runtimeConn = comm->cuMemSupport && ncclParamRuntimeConnect();
   if (comm->runtimeConn) {
     for (int c=0; c<comm->nChannels; c++) {
+      // 循环先把每个 channel 的 ring/tree 结构准备好
       NCCLCHECKGOTO(setupChannel(comm, c, rank, nranks, rings+c*nranks), ret, fail);
     }
-    // Setup NVLS
+    // Setup NVLS  NVLink SHARP 网络内计算 在执行集合通信操作（如AllReduce）时，NVLS可以将数据归约（如求和）的工作从GPU转移到NVSwitch交换机中完
     NCCLCHECKGOTO(ncclNvlsSetup(comm, parent), ret, fail);
     // Check if we can setup CollNet
     if (comm->collNetSupport > 0) ncclCollNetSetup(comm, parent, graphs);
@@ -1178,6 +1183,8 @@ static ncclResult_t initTransportsRank(struct ncclComm* comm, struct ncclComm* p
     for (int c=0; c<comm->nChannels; c++) {
       NCCLCHECKGOTO(setupChannel(comm, c, rank, nranks, rings+c*nranks), ret, fail);
     }
+
+    //******* NET sendSetup 的初始调用链（主路径） ******* 把 ring 相邻 peer（prev/next）之间的传输连接建立起来，
     NCCLCHECKGOTO(ncclTransportRingConnect(comm), ret, fail);
 
     // Connect PAT only for communicators with 1 GPU per node
@@ -1373,119 +1380,24 @@ fail:
   goto exit;
 }
 
-// &&&
-// ncclCommInitRankFunc(job_)
-//        │
-//        ▼
-// ┌──────────────────────────────────────────────────┐
-// │ ① CUDA 设备准备                                   │
-// │   - cudaSetDevice(cudaDev)    ← 切换到目标 GPU    │
-// │   - cudaDeviceGetAttribute    ← 获取计算能力       │
-// │     (archMajor, archMinor, maxSharedMem)          │
-// │   - cudaArch = 100*archMajor + 10*archMinor       │
-// │     例如: A100 → 800, H100 → 900, B200 → 1000    │
-// └──────────────────────┬───────────────────────────┘
-//                        │
-//                        ▼
-// ┌──────────────────────────────────────────────────┐
-// │ ② NCCL Kernel 初始化                              │
-// │   - ncclInitKernelsForDevice(cudaArch, ...)       │
-// │     ← 为当前 GPU 架构加载/编译 CUDA kernel         │
-// │   - 如果开启了 SetStackSize 环境变量:              │
-// │     cudaDeviceSetLimit(cudaLimitStackSize, ...)   │
-// │     ← 预设置 kernel 栈大小，避免 CUDA 运行时重配置   │
-// └──────────────────────┬───────────────────────────┘
-//                        │
-//                        ▼
-// ┌──────────────────────────────────────────────────┐
-// │ ③ 分支: 是 ncclCommSplit 还是 ncclCommInitRank?  │
-// │                                                   │
-// │ 判断: job->parent != NULL?                        │
-// └──────────────────────┬───────────────────────────┘
-//                        │
-//          ┌─────────────┴─────────────┐
-//          ▼                           ▼
-//     ┌──────────────┐          ┌──────────────────┐
-//     │ Split 路径    │          │ InitRank 路径     │
-//     │              │          │                  │
-//     │ ① commGet    │          │ ① commAlloc      │
-//     │   SplitInfo   │          │   (无父 comm)    │
-//     │   ← 计算当前  │          │                  │
-//     │   的 nranks,  │          │ ② 哈希计算:      │
-//     │   myrank     │          │   getHash(commId) │
-//     │              │          │                  │
-//     │ ② 如果 color │          │ ③ bootstrapInit  │
-//     │   == NOCOLOR │          │   ← 通过 bootstrap│
-//     │   → 直接退出 │          │   建立多节点握手   │
-//     │   (不创建子  │          │                  │
-//     │    comm)     │          │                  │
-//     │              │          │                  │
-//     │ ③ commAlloc  │          │                  │
-//     │   (继承父)   │          │                  │
-//     │              │          │                  │
-//     │ ④ 哈希计算:  │          │                  │
-//     │   eatHash(   │          │                  │
-//     │   父hash,    │          │                  │
-//     │   splitCount,│          │                  │
-//     │   color)     │          │                  │
-//     │              │          │                  │
-//     │ ⑤ bootstrap  │          │                  │
-//     │   Split      │          │                  │
-//     │   ← 基于父   │          │                  │
-//     │   通信器重连 │          │                  │
-//     └──────┬───────┘          └────────┬─────────┘
-//            │                          │
-//            └──────────┬───────────────┘
-//                       ▼
-// ┌──────────────────────────────────────────────────┐
-// │ ④ 通用初始化路径（两个分支汇合点）                   │
-// │                                                   │
-// │   initTransportsRank(comm, parent, timers)        │
-// │   ← 核心传输层初始化：                              │
-// │      ├── 拓扑发现 (topo detection)                 │
-// │      ├── AllGather 数据交换 (rank 间信息收集)        │
-// │      ├── 图算法选择 (Ring/Tree 等拓扑图构建)        │
-// │      └── 连接建立 (P2P/NET/SHM 传输通道)           │
-// │                                                   │
-// │   ncclTunerPluginLoad(comm)                       │
-// │   ← 加载调优插件                                   │
-// │   if (comm->tuner)                                │
-// │     comm->tuner->init(...)                        │
-// │     ← 初始化调优器上下文                            │
-// └──────────────────────┬───────────────────────────┘
-//                        │
-//                        ▼
-// ┌──────────────────────────────────────────────────┐
-// │ ⑤ 收尾工作                                       │
-// │                                                   │
-// │   comm->initState = ncclSuccess  ← 标记初始化完成  │
-// │                                                   │
-// │   Split 分支特殊处理:                              │
-// │   __atomic_store_n(&parent->childAbortFlag, NULL)  │
-// │   ← 解除子 comm 对父 comm 的中止标志引用           │
-// │                                                   │
-// │   输出计时日志 (Init timings)                       │
-// │   ├── kernels: kernel 加载时间                     │
-// │   ├── alloc: 内存分配时间                          │
-// │   ├── bootstrap: 多节点握手时间                     │
-// │   ├── allgathers: 数据交换时间                      │
-// │   ├── topo: 拓扑发现时间                            │
-// │   ├── graphs: 图算法选择时间                        │
-// │   ├── connections: 连接建立时间                     │
-// │   └── total: 总耗时                                │
-// └──────────────────────┬───────────────────────────┘
-//                        │
-//                        ▼
-// exit:
-//   __atomic_store_n(job->newcomm, comm, __ATOMIC_RELEASE)
-//   ← 将初始化完成的 comm 原子写入用户指针
-//   ← 异步线程执行时，主线程通过此指针获取结果
-//   free(parentRanks)
-//   return res
+// &&&  本函数是初始化的“执行体”，在后台线程里完成 GPU 绑定 → kernel 准备 → 按 split/新建分叉做内存分配与 bootstrap 握手 → 传输层组网 → 加载 tuner → 翻转状态并发布 comm，全程用 timers[] 分段计时供性能诊断
+// ncclCommInitRank / ...Config / ...Scalable / ncclCommInitAll
+//         │
+//         ▼
+// ncclCommInitRankDev  ── 校验/分配/解析配置/打包 job
+//         │  ncclAsyncLaunch（后台线程）
+//         ▼
+// ★ ncclCommInitRankFunc（本函数）
+//         ├─ cudaSetDevice + 查架构属性
+//         ├─ ncclInitKernelsForDevice        [KERNELS]
+//         ├─ 分叉：
+//         │    parent → commGetSplitInfo → commAlloc → bootstrapSplit
+//         │    否则   → commAlloc → bootstrapInit
+//         │                                    [ALLOC][BOOTSTRAP]
+//         ├─ initTransportsRank               [ALLGATHER/TOPO/GRAPHS/CONNECT]
+//         ├─ ncclTunerPluginLoad + tuner->init
+//         └─ initState=Success，发布 comm，打印 Init timings
 
-// fail:
-//   comm->initState = res  ← 记录失败状态
-//   goto exit
 static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   struct ncclCommInitRankAsyncJob* job = (struct ncclCommInitRankAsyncJob*)job_;
   ncclComm_t comm = job->comm;
@@ -1497,18 +1409,20 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   int cudaArch;
   int maxSharedMem = 0;
   double sum_timers = 0;
+  // 局部变量与总计时开始
   uint64_t timers[TIMERS_INIT_COUNT] = {0};
   unsigned long long commIdHash;
 
-  timers[TIMER_INIT_TOTAL] = clockNano();
+  timers[TIMER_INIT_TOTAL] = clockNano(); //clockNano() 取当前单调时钟
+  // 后台线程（异步工作线程）是独立线程，不继承主线程的 device 绑定，所以必须先 cudaSetDevice(cudaDev) 把本线程绑到该 rank 的 GPU
   CUDACHECKGOTO(cudaSetDevice(cudaDev), res, fail);
-  CUDACHECKGOTO(cudaDeviceGetAttribute(&maxSharedMem, cudaDevAttrMaxSharedMemoryPerBlockOptin, cudaDev), res, fail);
-  CUDACHECKGOTO(cudaDeviceGetAttribute(&archMajor, cudaDevAttrComputeCapabilityMajor, cudaDev), res, fail);
+  CUDACHECKGOTO(cudaDeviceGetAttribute(&maxSharedMem, cudaDevAttrMaxSharedMemoryPerBlockOptin, cudaDev), res, fail); //每 block 可 opt-in 的最大共享内存，决定 kernel 能否用大 shared buffer
+  CUDACHECKGOTO(cudaDeviceGetAttribute(&archMajor, cudaDevAttrComputeCapabilityMajor, cudaDev), res, fail); //获取 GPU 的计算能力 major 版本
   CUDACHECKGOTO(cudaDeviceGetAttribute(&archMinor, cudaDevAttrComputeCapabilityMinor, cudaDev), res, fail);
   cudaArch = 100*archMajor + 10*archMinor;
 
   timers[TIMER_INIT_KERNELS] = clockNano();
-  NCCLCHECK(ncclInitKernelsForDevice(cudaArch, maxSharedMem, &maxLocalSizeBytes));
+  NCCLCHECK(ncclInitKernelsForDevice(cudaArch, maxSharedMem, &maxLocalSizeBytes)); //初始化 kernel 模块 根据架构和共享内存上限，准备/加载本设备要用的集合通信 kernel，并回填 maxLocalSizeBytes（这些 kernel 需要的最大栈大小）
   // Set the maximum kernel stack size of all kernels to avoid
   // a CUDA memory reconfig on load (c.f. NVSHMEM issue)
   if (maxLocalSizeBytes > 0 && ncclParamSetStackSize() == 1) {
@@ -1517,16 +1431,22 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   }
   timers[TIMER_INIT_KERNELS] = clockNano() - timers[TIMER_INIT_KERNELS];
 
+  // 核心分叉：Split 子通信 vs 全新通信
+  // job->parent != NULL（来自 ncclCommSplit）
+  // job->parent == NULL（来自 ncclCommInitRank 等）
   if (job->parent) {
     NCCLCHECKGOTO(ncclCalloc(&parentRanks, job->parent->nRanks), res, fail);
+    // 通过父通信域的 bootstrap 做一次 allgather，收集所有 rank 的 (color, key)，
+    // 据此算出新通信域的规模 job->nranks、本进程新 rank job->myrank，以及 parentRanks（新 rank → 父 rank 的映射）
     NCCLCHECKGOTO(commGetSplitInfo(comm, job->parent, job->color, job->key, &job->nranks, &job->myrank, parentRanks), res, fail);
-    // Negative color does not create a new comm object. We needed to take part in the allgather, but we're done now.
+    // Negative color does not create a new comm object. We needed to take part in the allgather, but we're done now. 本 rank 不加入任何新通信域。但它仍要参与上面那次 allgather（否则别人会阻塞），参与完直接 goto exit——不分配、不组网
     if (job->color == NCCL_SPLIT_NOCOLOR) goto exit;
     timers[TIMER_INIT_ALLOC] = clockNano();
-    // ****4
-    NCCLCHECKGOTO(commAlloc(comm, job->parent, job->nranks, job->myrank), res, fail);
+    // ****4   为新 comm 分配核心资源（含网络插件加载 ncclNetPluginLoad/ncclNetInit、CUDA context、共享资源等，就是文件里 //****4 标注的地方）。传入 parent 以便决定是否共享资源。
+    NCCLCHECKGOTO(commAlloc(comm, job->parent, job->nranks, job->myrank), res, fail);  //分配通信资源
     timers[TIMER_INIT_ALLOC] = clockNano() - timers[TIMER_INIT_ALLOC];
     // child hash obtained from (parent hash, split count, color)
+    // 子通信域的 commHash 由三要素增量哈希得出：父 hash + split 次数 + color。这保证：同一次 split、同一 color 的所有 rank 算出相同的 hash（它们属于同一个新 comm），而不同 color/不同 split 得到不同 hash
     uint64_t hacc[2] = {1, 1};
     eatHash(hacc, &job->parent->commHash);
     eatHash(hacc, &job->splitCount);
@@ -1535,6 +1455,8 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
     INFO(NCCL_INIT, "%s comm %p rank %d nranks %d cudaDev %d nvmlDev %d busId %lx parent %p splitCount %d color %d key %d- Init START", job->funcName,
          comm, comm->rank, comm->nRanks, comm->cudaDev, comm->nvmlDev, comm->busId, job->parent, job->splitCount, job->color, job->key);
     timers[TIMER_INIT_BOOTSTRAP] = clockNano();
+    //Bootstrap 握手：bootstrapInit() 或 bootstrapSplit()
+    // bootstrapSplit：基于父 bootstrap 网络，为新子集建立独立的 bootstrap 环，不需要用户再传 uniqueId。
     NCCLCHECKGOTO(bootstrapSplit(comm->commHash, comm, job->parent, job->color, job->key, parentRanks), res, fail);
     timers[TIMER_INIT_BOOTSTRAP] = clockNano() - timers[TIMER_INIT_BOOTSTRAP];
     // debug info, no commId was used
@@ -1544,29 +1466,36 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
     // ****
     NCCLCHECKGOTO(commAlloc(comm, NULL, job->nranks, job->myrank), res, fail);
     timers[TIMER_INIT_ALLOC] = clockNano() - timers[TIMER_INIT_ALLOC];
-    // obtain a unique hash using the first commId
+    // obtain a unique hash using the first commId  
+    // 直接由用户的 commId（uniqueId）哈希得到——所有传同一 uniqueId 的进程算出同一 hash。
     comm->commHash = commIdHash = getHash(job->commId->internal, NCCL_UNIQUE_ID_BYTES);
     INFO(NCCL_INIT, "%s comm %p rank %d nranks %d cudaDev %d nvmlDev %d busId %lx commId 0x%llx - Init START", job->funcName,
          comm, comm->rank, comm->nRanks, comm->cudaDev, comm->nvmlDev, comm->busId, commIdHash);
     timers[TIMER_INIT_BOOTSTRAP] = clockNano();
+
+    //  通过 ncclUniqueId 中携带的地址信息，跨节点所有进程之间做 rendezvous 握手，建立全局的 rank 映射
+    // 用 job->nId 个 bootstrap handle（对应 ncclCommInitRankScalable 的多 root）把所有 rank 连成 bootstrap 环，为后续 allgather 打基础
     NCCLCHECKGOTO(bootstrapInit(job->nId, (struct ncclBootstrapHandle*)job->commId, comm), res, fail);
     timers[TIMER_INIT_BOOTSTRAP] = clockNano() - timers[TIMER_INIT_BOOTSTRAP];
   }
   comm->cudaArch = cudaArch;
 
+  // 传输层初始化：initTransportsRank() — 建立 GPU 间通信链接 真正的 GPU 间数据传输通道（同节点 NVLink / P2P，跨节点 RDMA / Socket）
+  // initTransportsRank 是整个初始化的大头：拓扑探测、计算 GPU/NIC 路径、生成 Ring/Tree/CollNet/NVLS 各种通信图、两轮 allgather 交换拓扑、建立 P2P/网络连接、算带宽时间模型……它内部会继续填充 timers[] 的 ALLGATHER/TOPO/GRAPHS/CONNECT 等分项。传入 timers 就是为了让子函数把各阶段耗时写回来。
   NCCLCHECKGOTO(initTransportsRank(comm, job->parent, timers), res, fail);
   NCCLCHECKGOTO(ncclTunerPluginLoad(comm), res, fail);
-  if (comm->tuner) {
+  if (comm->tuner) {  //加载并初始化 tuner 插件（可选的算法/协议调优器）。加载成功才调 init，传入规模信息和日志回调，得到 tunerContext
     NCCLCHECK(comm->tuner->init(comm->nRanks, comm->nNodes, ncclDebugLog, &comm->tunerContext));
   }
 
-  // update communicator state
+  // update communicator state  
+  // initState 从之前的 ncclInProgress 翻成 ncclSuccess——这是非阻塞初始化的关键：用户通过 ncclCommGetAsyncError 轮询这个状态判断 comm 是否就绪。
   comm->initState = ncclSuccess;
   timers[TIMER_INIT_TOTAL] = clockNano() - timers[TIMER_INIT_TOTAL];
 
-  // Trace this call for replay tool
+  // Trace this call for replay tool         Trace 耗时日志
   if (job->parent) {
-    /* unlink child abort flag. */
+    /* unlink child abort flag. */  //split 路径要解绑父的 childAbortFlag：初始化期间父 comm 借这个标志能中止正在初始化的子 comm，现在初始化成功，用原子 release 写把它置回 NULL，解除关联
     __atomic_store_n(&job->parent->childAbortFlag, NULL, __ATOMIC_RELEASE);
     TRACE_CALL("ncclCommSplit(%p, %d, %d, %p, %d, %d)", job->parent, job->color, job->key, comm, comm->rank, comm->nRanks);
     INFO(NCCL_INIT, "%s comm %p rank %d nranks %d cudaDev %d nvmlDev %d busId %lx parent %p splitCount %d color %d key %d - Init COMPLETE", job->funcName,
@@ -1579,6 +1508,7 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
   }
   sum_timers = 0.0;
   for (int it = 1; it < TIMERS_INIT_COUNT; ++it)
+    // 把各分阶段（kernels/alloc/bootstrap/allgathers/topo/graphs/connections）耗时累加成 sum_timers，注意从 it=1 开始跳过 TIMER_INIT_TOTAL（下标 0）
     sum_timers += (timers[it] / 1e9);
   INFO(NCCL_INIT | NCCL_PROFILE,
        "Init timings - %s: rank %d nranks %d total %.2f (kernels %.2f, alloc %.2f, bootstrap %.2f, allgathers %.2f, topo %.2f, graphs %.2f, "
@@ -1589,13 +1519,14 @@ static ncclResult_t ncclCommInitRankFunc(struct ncclAsyncJob* job_) {
        timers[TIMER_INIT_GRAPHS] / 1e9, timers[TIMER_INIT_CONNECT] / 1e9, timers[TIMER_INIT_TOTAL] / 1e9 - sum_timers);
 exit:
   if (job->newcomm) {
-    /* assign it to user pointer. */
+    //job->newcomm 只有 ncclCommSplit 会设置（指向用户的 *newcomm）。用原子 release 写把 comm 指针交给用户——保证用户看到指针时，前面所有初始化写操作都已可见
+    /* assign it to user pointer. */  
     __atomic_store_n(job->newcomm, comm, __ATOMIC_RELEASE);
   }
-  free(parentRanks);
+  free(parentRanks);  //只有 split 分支分配过，非 split 时它是 NULL，free(NULL) 安全
   return res;
 fail:
-  comm->initState = res;
+  comm->initState = res;  // 把错误码写进 comm->initState（这样用户轮询能拿到失败状态），再走 exit 做统一清理。注意即使失败，exit 里仍会把 comm 发布给用户——用户随后通过 initState 得知失败并调用 ncclCommDestroy/Abort 清理
   goto exit;
 }
 

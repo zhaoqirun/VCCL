@@ -22,24 +22,31 @@ NCCL_PARAM(L1SharedMemoryCarveout, "L1_SHARED_MEMORY_CARVEOUT", 0);
 extern int64_t ncclParamPassSm();
 const int nccl_fault_tolerance_enable = ncclGetEnv("NCCL_ENABLE_FAULT_TOLERANCE") ? atoi(ncclGetEnv("NCCL_ENABLE_FAULT_TOLERANCE")) : 0;
 // Returns maximum kernel stack size of all CUDA kernels
+// 在 NCCL 初始化阶段被调用，用来为当前 GPU 设备配置所有 CUDA kernel 的运行时属性，并顺带计算出所有 kernel 中最大的栈空间需求（返回给调用方）。
+// cudaArch：目标 GPU 的计算架构（如 80、90 等）。
+// maxSharedMem：设备/函数可用的最大共享内存字节数。
+// maxStackSize（输出）：遍历所有 kernel 后，得到的最大本地栈大小。
 ncclResult_t ncclInitKernelsForDevice(int cudaArch, int maxSharedMem, size_t* maxStackSize) {
   ncclResult_t result = ncclSuccess;
 
+  // // 读取环境变量 NCCL_L1_SHARED_MEMORY_CARVEOUT
   if (maxStackSize) *maxStackSize = 0;
-  int carveout = ncclParamL1SharedMemoryCarveout();
-  int ncclMaxSharedMem = ncclShmemDynamicSize(cudaArch);
+  int carveout = ncclParamL1SharedMemoryCarveout(); // 读取环境变量 NCCL_L1_SHARED_MEMORY_CARVEOUT
+  int ncclMaxSharedMem = ncclShmemDynamicSize(cudaArch);  // 该架构需要的动态共享内存大小
 
+  // 遍历全局 kernel 列表 ncclDevKernelList。有些 kernel 可能没有被编译进当前构建（为 nullptr），直接跳过。
   for (int k=0; k < ncclDevKernelCount; k++) {
     void* fn = ncclDevKernelList[k];
     cudaFuncAttributes attr = {0};
-    if (fn == nullptr) continue;
+    if (fn == nullptr) continue; // 跳过未编译进来的 kernel
 
+    // 调用 cudaFuncGetAttributes 拿到 kernel 属性。attr.localSizeBytes 是该 kernel 的本地内存（栈）大小，用它更新全局最大值。这里用 CUDACHECKGOTO 宏：如果出错就跳到 ignore0 标签，忽略错误继续执行（这是一种“尽力而为”的容错设计）
     CUDACHECKGOTO(cudaFuncGetAttributes(&attr, fn), result, ignore0);
     if (maxStackSize) {
       if (attr.localSizeBytes > *maxStackSize) *maxStackSize = attr.localSizeBytes;
     ignore0:;
     }
-    if (carveout) {
+    if (carveout) { //如果配置了 carveout，就设置每个 kernel 的「L1 缓存 vs 共享内存」偏好比例。出错同样忽略。
       CUDACHECKGOTO(cudaFuncSetAttribute(fn,
         cudaFuncAttributePreferredSharedMemoryCarveout, carveout),
         result, ignore1);
@@ -47,10 +54,11 @@ ncclResult_t ncclInitKernelsForDevice(int cudaArch, int maxSharedMem, size_t* ma
     }
     if (ncclMaxSharedMem != 0) {
       int sharedMemSize = ncclMaxSharedMem;
+      // 如果该架构需要动态共享内存，先检查是否超出设备限制（maxSharedMem - attr.sharedSizeBytes，即减去静态已占用部分）。超出就 WARN 并返回错误；否则通过 cudaFuncSetAttribute 提升该 kernel 的动态共享内存上限。这一步是必须的，因为 CUDA 默认动态共享内存上限只有 48KB，NCCL 常常需要更多
       if (sharedMemSize > (maxSharedMem-attr.sharedSizeBytes)) {
         WARN("cudaArch %d ncclMaxSharedMem %d exceeds device/fn maxSharedMem %zu",
              cudaArch, sharedMemSize, maxSharedMem-attr.sharedSizeBytes);
-        return ncclSystemError;
+        return ncclSystemError; // 超出硬件上限，直接报错
       }
       CUDACHECKGOTO(cudaFuncSetAttribute(fn,
         cudaFuncAttributeMaxDynamicSharedMemorySize, sharedMemSize),

@@ -2,6 +2,7 @@
 #include "transport.h"
 #include "bootstrap.h"
 
+// 专门负责把所有 channel 的 ring 邻居连接建立起来，并汇总 GDR / PXN 使用情况。
 ncclResult_t ncclTransportRingConnect(struct ncclComm* comm) {
   struct ringConnInfo {
     bool useNetPXN;
@@ -14,8 +15,12 @@ ncclResult_t ncclTransportRingConnect(struct ncclComm* comm) {
     comm->useNetPXN = false;
     for (int c = 0; c < comm->nChannels; c++) {
       struct ncclChannel* channel = comm->channels + c;
+      // 
       NCCLCHECKGOTO(ncclTransportP2pConnect(comm, c, 1, &channel->ring.prev, 1, &channel->ring.next, 0), ret, fail);
     }
+    // *******Setup Ring  进入统一的 P2P 传输建连入口 *******
+    // 函数内先对每个 channel 调用 ncclTransportP2pConnect（generic.cc:16）——它只是把“要连接的 send/recv peer”登记进 comm->connectSend/Recv 位掩码
+    // 随后的ncclTransportP2pSetup(comm, &comm->graphs[NCCL_ALGO_RING], 0)才真正执行建链
     NCCLCHECKGOTO(ncclTransportP2pSetup(comm, &comm->graphs[NCCL_ALGO_RING], 0), ret, fail);
     if (ncclParamLocalRegister() || ncclParamGraphRegister()) {
       NCCLCHECK(ncclCalloc(&ringInfo, comm->nRanks));
